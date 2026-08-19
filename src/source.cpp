@@ -703,6 +703,30 @@ SourceSite MeshSource::sample(uint64_t* seed) const
 }
 
 //==============================================================================
+// TokamakSource helper functions
+//==============================================================================
+
+namespace {
+
+//! Safe cylindrical Bessel function handling negative order n via parity: J_{-n}(x) = (-1)^n J_n(x)
+inline double bessel_j(int n, double x)
+{
+  if (n < 0) {
+    return ((std::abs(n) % 2 == 1) ? -1.0 : 1.0) *
+           openmc::cyl_bessel_j(std::abs(n), x);
+  }
+  return openmc::cyl_bessel_j(n, x);
+}
+
+//! Kronecker delta helper
+inline double kronecker_delta(int i, int j)
+{
+  return (i == j) ? 1.0 : 0.0;
+}
+
+} // namespace
+
+//==============================================================================
 // TokamakSource implementation
 //==============================================================================
 
@@ -711,8 +735,6 @@ TokamakSource::TokamakSource(pugi::xml_node node) : Source(node)
   // Read geometry parameters
   major_radius_ = std::stod(get_node_value(node, "major_radius"));
   minor_radius_ = std::stod(get_node_value(node, "minor_radius"));
-  elongation_ = std::stod(get_node_value(node, "elongation"));
-  triangularity_ = std::stod(get_node_value(node, "triangularity"));
   shafranov_shift_ = std::stod(get_node_value(node, "shafranov_shift"));
 
   // Read optional vertical shift
@@ -742,6 +764,51 @@ TokamakSource::TokamakSource(pugi::xml_node node) : Source(node)
   // Read emission profile
   r_over_a_ = get_node_array<double>(node, "r_over_a");
   emission_density_ = get_node_array<double>(node, "emission_density");
+
+  // Read elongation (scalar or array)
+  vector<double> elong_arr = get_node_array<double>(node, "elongation");
+  if (elong_arr.size() > 1) {
+    is_profile_ = true;
+    elongation_profile_ = std::move(elong_arr);
+  } else if (!elong_arr.empty()) {
+    elongation_ = elong_arr[0];
+  } else {
+    fatal_error("TokamakSource: elongation must be provided.");
+  }
+  // Read triangularity (scalar or array)
+  vector<double> triang_arr = get_node_array<double>(node, "triangularity");
+  if (triang_arr.size() > 1) {
+    is_profile_ = true;
+    triangularity_profile_ = std::move(triang_arr);
+  } else if (!triang_arr.empty()) {
+    triangularity_ = triang_arr[0];
+  } else {
+    fatal_error("TokamakSource: triangularity must be provided.");
+  }
+  // Read derivatives if present
+  if (check_for_node(node, "elongation_prime")) {
+    elongation_prime_ = get_node_array<double>(node, "elongation_prime");
+    is_profile_ = true;
+  }
+  if (check_for_node(node, "triangularity_prime")) {
+    triangularity_prime_ = get_node_array<double>(node, "triangularity_prime");
+    is_profile_ = true;
+  }
+  // Handle mixed scalar / profile broadcasting
+  if (is_profile_) {
+    if (elongation_profile_.empty()) {
+      elongation_profile_.assign(r_over_a_.size(), elongation_);
+      elongation_prime_.assign(r_over_a_.size(), 0.0);
+    } else if (elongation_prime_.empty()) {
+      elongation_prime_.assign(r_over_a_.size(), 0.0);
+    }
+    if (triangularity_profile_.empty()) {
+      triangularity_profile_.assign(r_over_a_.size(), triangularity_);
+      triangularity_prime_.assign(r_over_a_.size(), 0.0);
+    } else if (triangularity_prime_.empty()) {
+      triangularity_prime_.assign(r_over_a_.size(), 0.0);
+    }
+  }
 
   // Read energy distribution(s)
   for (auto energy_node : node.children("energy")) {
@@ -792,12 +859,32 @@ TokamakSource::TokamakSource(pugi::xml_node node) : Source(node)
   if (minor_radius_ >= major_radius_) {
     fatal_error("TokamakSource: minor_radius must be less than major_radius.");
   }
-  if (elongation_ <= 0.0) {
-    fatal_error("TokamakSource: elongation must be > 0.");
+  if (is_profile_) {
+    if (elongation_profile_.size() != r_over_a_.size() ||
+        elongation_prime_.size() != r_over_a_.size()) {
+      fatal_error("TokamakSource: elongation profile size must match r_over_a.");
+    }
+    if (triangularity_profile_.size() != r_over_a_.size() ||
+        triangularity_prime_.size() != r_over_a_.size()) {
+      fatal_error("TokamakSource: triangularity profile size must match r_over_a.");
+    }
+    for (double k : elongation_profile_) {
+      if (k <= 0.0) fatal_error("TokamakSource: elongation values must be > 0.");
+    }
+    for (double d : triangularity_profile_) {
+      if (d < -1.0 || d > 1.0) {
+        fatal_error("TokamakSource: triangularity values must be in [-1, 1].");
+      }
+    }
+  } else {
+    if (elongation_ <= 0.0) {
+      fatal_error("TokamakSource: elongation must be > 0.");
+    }
+    if (triangularity_ < -1.0 || triangularity_ > 1.0) {
+      fatal_error("TokamakSource: triangularity must be in the range [-1, 1].");
+    }
   }
-  if (triangularity_ < -1.0 || triangularity_ > 1.0) {
-    fatal_error("TokamakSource: triangularity must be in the range [-1, 1].");
-  }
+
   if (shafranov_shift_ < 0.0) {
     fatal_error("TokamakSource: shafranov_shift must be >= 0.");
   }
@@ -834,6 +921,19 @@ TokamakSource::TokamakSource(pugi::xml_node node) : Source(node)
 }
 
 void TokamakSource::precompute_sampling_distributions()
+{
+  if (is_profile_) {
+    precompute_fourier_distributions();
+  } else {
+    precompute_bernstein_distributions();
+  }
+}
+
+//==============================================================================
+// Bernstein basis precomputation (for scalar elongation and triangularity)
+//==============================================================================
+
+void TokamakSource::precompute_bernstein_distributions()
 {
   // Use precomputed normalized geometry parameters
   double eps = epsilon_;    // Inverse aspect ratio (a/R0)
@@ -1002,6 +1102,232 @@ void TokamakSource::precompute_sampling_distributions()
   }
 }
 
+//==============================================================================
+// Fourier series analytic precomputation (for 1D profile elongation & triangularity)
+//==============================================================================
+
+//! Compute the n-th Fourier coefficient c_hat_n(r) of the joint density R_tilde * J_tilde:
+//!   c_hat_n(r) = (1 / 2*pi) * int_0^{2*pi} R_tilde(r, alpha) * J_tilde(r, alpha) * exp(-i*n*alpha) dalpha
+//!
+//! Using the Jacobi-Anger expansion exp(i*z*sin(alpha)) = sum_m J_m(z)*exp(i*m*alpha), the integral
+//! decomposes into two pieces:
+//!   piece1: from (1 + eps*Dt*(1 - r^2)) * J_tilde
+//!   piece2: from (eps * r * cos(alpha + delta*sin(alpha))) * J_tilde
+//!
+//! Because R_tilde * J_tilde is an even function of alpha, all c_hat_n(r) are real and c_hat_n = c_hat_{-n}.
+double TokamakSource::compute_fourier_coeff(int n, double r, double k,
+  double kp, double d, double dp) const
+{
+  double eps = epsilon_;    // Inverse aspect ratio a / R0
+  double Dt = delta_tilde_; // Normalized Shafranov shift Delta / a
+  double A = (k * d) - (k * r * dp) + (kp * r * d);
+  double sign_n = (n % 2 == 0) ? 1.0 : -1.0;
+  double kd1 = kronecker_delta(n, 1) + kronecker_delta(n, -1);
+
+  // Piece 1: Leading flux surface term (1 + eps*Dt - eps*Dt*r^2) * J_tilde
+  double piece1 = 0.5 * (
+    (1.0 + eps * Dt - eps * Dt * r * r) * (
+      (k + 0.5 * kp * r) * (bessel_j(n, d) + sign_n * bessel_j(n, d)) -
+      (0.5 * kp * r) * (bessel_j(n - 2, d) + sign_n * bessel_j(n + 2, d)) +
+      (0.25 * A) * (bessel_j(n - 1, -d) - sign_n * bessel_j(n + 1, -d)) -
+      (0.25 * A) * (bessel_j(n - 3, d) - sign_n * bessel_j(n + 3, d)) -
+      2.0 * k * Dt * r * kd1
+    )
+  );
+
+  // Piece 2: Toroidal shift cross-term (eps * r * cos(psi)) * J_tilde
+  double piece2 = 0.25 * eps * r * (
+    (k + 0.5 * kp * r) * (bessel_j(n - 1, 2.0 * d) - sign_n * bessel_j(n + 1, 2.0 * d) + kd1) -
+    (0.5 * kp * r) * (bessel_j(n - 3, 2.0 * d) - sign_n * bessel_j(n + 3, 2.0 * d) + kd1) +
+    (0.25 * A) * (bessel_j(n, 2.0 * d) + sign_n * bessel_j(n, 2.0 * d) -
+                  bessel_j(n - 4, 2.0 * d) - sign_n * bessel_j(n + 4, 2.0 * d)) -
+    2.0 * k * Dt * r * (bessel_j(n, d) + sign_n * bessel_j(n, d) +
+                        bessel_j(n - 2, d) + sign_n * bessel_j(n + 2, d))
+  );
+
+  return piece1 + piece2;
+}
+
+int TokamakSource::compute_sum_size(double error_tol) const
+{
+  double min_c0 = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < r_over_a_.size(); ++i) {
+    double r = r_over_a_[i];
+    double k = elongation_profile_[i];
+    double kp = elongation_prime_[i];
+    double d = triangularity_profile_[i];
+    double dp = triangularity_prime_[i];
+    double c0 = std::abs(compute_fourier_coeff(0, r, k, kp, d, dp));
+    if (c0 < min_c0 && c0 > 0.0) {
+      min_c0 = c0;
+    }
+  }
+  if (std::isinf(min_c0) || min_c0 <= 0.0) {
+    return 30; // Safe fallback
+  }
+  // Formula from Section 1.3 of LaTeX proof:
+  // N = ceil(log2(1 / ((2*pi)^1.5 * error_tol * min_c0)))
+  double N = std::ceil(std::log2(1.0 / (std::pow(2.0 * PI, 1.5) * error_tol * min_c0)));
+  return std::clamp(static_cast<int>(N), 10, 50);
+}
+
+void TokamakSource::precompute_fourier_distributions()
+{
+  double eps = epsilon_;
+  double Dt = delta_tilde_;
+  size_t n_r = r_over_a_.size();
+
+  //==========================================================================
+  // 1. MARGINAL RADIAL DISTRIBUTION p(r_tilde)
+  //==========================================================================
+  // Analytically integrate the joint density R_tilde * J_tilde over poloidal angle alpha:
+  //   p(r) ~ S(r) * r * M(r)
+  // where:
+  //   M(r) = (1 + eps*Dt - eps*Dt*r^2) * T1(r) + eps*r*pi * T2(r)
+  // with:
+  //   T1(r) = 2*pi*(k + kp*r/2)*J0(d) - pi*kp*r*J2(d) + (pi*A/2)*(J1(d) + J3(d))
+  //   T2(r) = -(k + kp*r/2)*J1(2d) + (kp*r/2)*J3(2d) + (A/4)*(J0(2d) - J4(2d)) - 2*k*Dt*r*(J0(d) + J2(d))
+  //   A(r)  = k*d - k*r*dp + kp*r*d
+
+  // Build a refined radial grid to resolve fine features in emission and geometric profiles
+  constexpr int MIN_SUBINTERVALS = 8;
+  constexpr double MAX_GRID_SPACING = 1.0e-3;
+  vector<double> radial_grid {r_over_a_.front()};
+  vector<double> radial_emission {emission_density_.front()};
+
+  for (size_t i = 1; i < n_r; ++i) {
+    double r_lo = r_over_a_[i - 1];
+    double r_hi = r_over_a_[i];
+    double s_lo = emission_density_[i - 1];
+    double s_hi = emission_density_[i];
+    int n_subintervals = std::max(MIN_SUBINTERVALS,
+      static_cast<int>(std::ceil((r_hi - r_lo) / MAX_GRID_SPACING)));
+    for (int j = 1; j <= n_subintervals; ++j) {
+      double t = static_cast<double>(j) / n_subintervals;
+      radial_grid.push_back(r_lo + t * (r_hi - r_lo));
+      radial_emission.push_back(s_lo + t * (s_hi - s_lo));
+    }
+  }
+
+  vector<double> radial_pdf(radial_grid.size());
+  for (size_t i = 0; i < radial_grid.size(); ++i) {
+    double r = radial_grid[i];
+    double k = get_elongation(r);
+    double d = get_triangularity(r);
+
+    // Linear interpolation of spatial derivatives for intermediate subintervals
+    size_t idx = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r);
+    if (idx >= n_r - 1) idx = n_r - 2;
+    double t = (r - r_over_a_[idx]) / (r_over_a_[idx + 1] - r_over_a_[idx]);
+    double kp = (1.0 - t) * elongation_prime_[idx] + t * elongation_prime_[idx + 1];
+    double dp = (1.0 - t) * triangularity_prime_[idx] + t * triangularity_prime_[idx + 1];
+    double A = (k * d) - (k * r * dp) + (kp * r * d);
+
+    double T1 = 2.0 * PI * (k + 0.5 * kp * r) * bessel_j(0, d) -
+                PI * kp * r * bessel_j(2, d) +
+                0.5 * PI * A * (bessel_j(1, d) + bessel_j(3, d));
+
+    double T2 = -(k + 0.5 * kp * r) * bessel_j(1, 2.0 * d) +
+                0.5 * kp * r * bessel_j(3, 2.0 * d) +
+                0.25 * A * (bessel_j(0, 2.0 * d) - bessel_j(4, 2.0 * d)) -
+                2.0 * k * Dt * r * (bessel_j(0, d) + bessel_j(2, d));
+
+    double geometric_factor =
+      (1.0 + eps * Dt - eps * Dt * r * r) * T1 + eps * r * PI * T2;
+
+    radial_pdf[i] = radial_emission[i] * r * std::max(0.0, geometric_factor);
+  }
+
+  // Normalize and construct Tabular radial distribution
+  double total = 0.0;
+  for (size_t i = 1; i < radial_grid.size(); ++i) {
+    total += 0.5 * (radial_pdf[i - 1] + radial_pdf[i]) *
+             (radial_grid[i] - radial_grid[i - 1]);
+  }
+  if (total <= 0.0) {
+    fatal_error(
+      "TokamakSource: Integrated emission density is zero or negative. "
+      "Check emission_density profile.");
+  }
+  radial_dist_ = make_unique<Tabular>(radial_grid.data(), radial_pdf.data(),
+    radial_grid.size(), Interpolation::lin_lin);
+
+  //==========================================================================
+  // 2. POLOIDAL CONDITIONAL DISTRIBUTIONS P(alpha | r_i)
+  //==========================================================================
+  // The conditional distribution P(alpha | r) is represented by a Fourier series:
+  //   P(alpha | r) = (1 / (2*pi*c_hat_0(r))) * sum_n c_hat_n(r) * exp(i*n*alpha)
+  //
+  // Integrating over [0, alpha] gives the exact analytic cumulative distribution:
+  //   F(alpha | r) = alpha / (2*pi) + (1 / (pi*c_hat_0(r))) * sum_{n=1}^N (c_hat_n(r) / n) * sin(n*alpha)
+  //
+  // Exploiting up-down symmetry across [0, pi] and normalizing on [0, pi]:
+  //   F_half(alpha | r) = alpha / pi + (2 / (pi*c_hat_0(r))) * sum_{n=1}^N (c_hat_n(r) / n) * sin(n*alpha)
+  //
+  // Truncation at N = 30 modes guarantees machine-level precision (< 1e-13 error)
+  // due to the super-exponential decay J_n(delta) ~ (e*delta / 2n)^n / sqrt(2*pi*n).
+
+  int n_alpha = n_alpha_;
+  vector<double> alpha_grid(n_alpha);
+  double dalpha = PI / (n_alpha - 1);
+  for (int j = 0; j < n_alpha; ++j) {
+    alpha_grid[j] = j * dalpha;
+  }
+
+  // Dynamically determine the truncation order N to guarantee machine precision (< 1e-15 error)
+  int n_fourier = compute_sum_size(1.0e-15);
+
+  fourier_poloidal_dists_.resize(n_r);
+  for (size_t i = 0; i < n_r; ++i) {
+    double r = r_over_a_[i];
+    double k = elongation_profile_[i];
+    double kp = elongation_prime_[i];
+    double d = triangularity_profile_[i];
+    double dp = triangularity_prime_[i];
+
+    // Compute Fourier coefficients c_hat_n for n = 0 ... n_fourier
+    double c0 = compute_fourier_coeff(0, r, k, kp, d, dp);
+    vector<double> cn(n_fourier + 1);
+    for (int n = 1; n <= n_fourier; ++n) {
+      cn[n] = compute_fourier_coeff(n, r, k, kp, d, dp);
+    }
+
+    // Evaluate normalized analytic CDF on alpha in [0, pi]
+    vector<double> cdf_half(n_alpha);
+    for (int j = 0; j < n_alpha; ++j) {
+      double alpha = alpha_grid[j];
+      double sum_terms = 0.0;
+      for (int n = 1; n <= n_fourier; ++n) {
+        sum_terms += (cn[n] / n) * std::sin(n * alpha);
+      }
+      cdf_half[j] = (alpha / PI) + (2.0 / (PI * c0)) * sum_terms;
+    }
+
+    // Enforce exact boundary values and monotonicity
+    cdf_half.front() = 0.0;
+    cdf_half.back() = 1.0;
+    for (int j = 1; j < n_alpha; ++j) {
+      if (cdf_half[j] < cdf_half[j - 1]) cdf_half[j] = cdf_half[j - 1];
+    }
+
+    // Evaluate corresponding PDF values on alpha in [0, pi]
+    vector<double> pdf_half(n_alpha);
+    for (int j = 0; j < n_alpha; ++j) {
+      double alpha = alpha_grid[j];
+      double sum_p = 0.0;
+      for (int n = 1; n <= n_fourier; ++n) {
+        sum_p += 2.0 * (cn[n] / c0) * std::cos(n * alpha);
+      }
+      pdf_half[j] = std::max(0.0, (1.0 + sum_p) / PI);
+    }
+
+    // Construct fast inverse-CDF Tabular distribution for this radial point
+    fourier_poloidal_dists_[i] = make_unique<Tabular>(
+      alpha_grid.data(), pdf_half.data(), n_alpha, Interpolation::lin_lin, cdf_half.data());
+  }
+}
+
+
 double TokamakSource::sample_r_over_a(uint64_t* seed) const
 {
   return radial_dist_->sample(seed).first;
@@ -1028,7 +1354,39 @@ double TokamakSource::mixture_weight(int k, double r) const
   }
 }
 
+double TokamakSource::get_elongation(double r_norm) const
+{
+  if (!is_profile_) return elongation_;
+  size_t i = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm);
+  if (i >= elongation_profile_.size() - 1) {
+    return elongation_profile_.back();
+  }
+  double t = (r_norm - r_over_a_[i]) / (r_over_a_[i + 1] - r_over_a_[i]);
+  return (1.0 - t) * elongation_profile_[i] + t * elongation_profile_[i + 1];
+}
+
+double TokamakSource::get_triangularity(double r_norm) const
+{
+  if (!is_profile_) return triangularity_;
+  size_t i = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm);
+  if (i >= triangularity_profile_.size() - 1) {
+    return triangularity_profile_.back();
+  }
+  double t = (r_norm - r_over_a_[i]) / (r_over_a_[i + 1] - r_over_a_[i]);
+  return (1.0 - t) * triangularity_profile_[i] + t * triangularity_profile_[i + 1];
+}
+
 double TokamakSource::sample_poloidal_angle(double r_norm, uint64_t* seed) const
+{
+  if (is_profile_) {
+    return sample_poloidal_angle_fourier(r_norm, seed);
+  } else {
+    return sample_poloidal_angle_bernstein(r_norm, seed);
+  }
+}
+
+double TokamakSource::sample_poloidal_angle_bernstein(
+  double r_norm, uint64_t* seed) const
 {
   // Sample from the conditional distribution P(alpha | r_tilde) using
   // mixture sampling with 6 precomputed basis distributions.
@@ -1077,6 +1435,31 @@ double TokamakSource::sample_poloidal_angle(double r_norm, uint64_t* seed) const
   return alpha;
 }
 
+double TokamakSource::sample_poloidal_angle_fourier(
+  double r_norm, uint64_t* seed) const
+{
+  // Multiple distributions: stochastic selection between bracketing r points
+  size_t i = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm);
+  size_t idx;
+  if (i >= fourier_poloidal_dists_.size() - 1) {
+    idx = fourier_poloidal_dists_.size() - 1;
+  } else {
+    // Stochastic interpolation: randomly select one of the two bracketing
+    // distributions based on distance to each
+    double t = (r_norm - r_over_a_[i]) / (r_over_a_[i + 1] - r_over_a_[i]);
+    idx = (prn(seed) < t) ? i + 1 : i;
+  }
+
+  // Sample alpha from [0, pi]
+  double alpha = fourier_poloidal_dists_[idx]->sample(seed).first;
+
+  // Exploit up-down symmetry: randomly flip to [pi, 2*pi] with 50% probability
+  if (prn(seed) >= 0.5) {
+    alpha = 2.0 * PI - alpha;
+  }
+  return alpha;
+}
+
 std::pair<double, double> TokamakSource::sample_energy(
   double r_norm, uint64_t* seed) const
 {
@@ -1105,18 +1488,22 @@ Position TokamakSource::flux_to_cartesian(
   double r, double alpha, double phi) const
 {
   // Flux surface parameterization:
-  // R = R0 + r*cos(alpha + delta*sin(alpha)) + Delta*(1 - (r/a)^2)
-  // Z = kappa * r * sin(alpha)
+  // R = R0 + r*cos(alpha + delta(r)*sin(alpha)) + Delta*(1 - (r/a)^2)
+  // Z = kappa(r) * r * sin(alpha)
   // x = R * cos(phi)
   // y = R * sin(phi)
   // z = Z
 
-  double psi = alpha + triangularity_ * std::sin(alpha);
-  double r_over_a_sq = (r * r) / (minor_radius_ * minor_radius_);
+  double r_norm = r / minor_radius_;
+  double kappa = get_elongation(r_norm);
+  double delta = get_triangularity(r_norm);
+
+  double psi = alpha + delta * std::sin(alpha);
+  double r_over_a_sq = r_norm * r_norm;
 
   double R =
     major_radius_ + r * std::cos(psi) + shafranov_shift_ * (1.0 - r_over_a_sq);
-  double Z = elongation_ * r * std::sin(alpha);
+  double Z = kappa * r * std::sin(alpha);
 
   double x = R * std::cos(phi);
   double y = R * std::sin(phi);

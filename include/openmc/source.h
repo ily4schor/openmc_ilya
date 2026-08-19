@@ -309,6 +309,8 @@ private:
 
   //! Precompute data structures for efficient sampling
   void precompute_sampling_distributions();
+  void precompute_bernstein_distributions();
+  void precompute_fourier_distributions();
 
   //! Sample minor radius from marginal CDF
   //! \param seed Pseudorandom seed pointer
@@ -321,11 +323,48 @@ private:
   //! \return Sampled poloidal angle alpha [rad]
   double sample_poloidal_angle(double r_norm, uint64_t* seed) const;
 
+  //! Sample poloidal angle using legacy Bernstein mixture sampling
+  //! \param r_norm Normalized minor radius r/a
+  //! \param seed Pseudorandom seed pointer
+  //! \return Sampled poloidal angle alpha [rad]
+  double sample_poloidal_angle_bernstein(double r_norm, uint64_t* seed) const;
+
+  //! Sample poloidal angle using Fourier series tabular distributions
+  //! \param r_norm Normalized minor radius r/a
+  //! \param seed Pseudorandom seed pointer
+  //! \return Sampled poloidal angle alpha [rad]
+  double sample_poloidal_angle_fourier(double r_norm, uint64_t* seed) const;
+
   //! Compute the k-th mixture weight w_k(r) * I_hat_k for poloidal sampling
   //! \param k Basis function index (0-5)
   //! \param r Normalized minor radius r/a
   //! \return Mixture weight for component k
   double mixture_weight(int k, double r) const;
+
+  //! Compute the n-th Fourier coefficient c_hat_n(r)
+  //! \param n Fourier mode index
+  //! \param r Normalized minor radius r/a
+  //! \param k Elongation kappa(r)
+  //! \param kp Elongation derivative dkappa/dr(r)
+  //! \param d Triangularity delta(r)
+  //! \param dp Triangularity derivative ddelta/dr(r)
+  //! \return Fourier coefficient c_hat_n(r)
+  double compute_fourier_coeff(int n, double r, double k, double kp, double d, double dp) const;
+  
+  //! Dynamically compute the number of Fourier modes required for target error tolerance
+  //! \param error_tol Error tolerance (default 1e-13)
+  //! \return Number of modes N
+  int compute_sum_size(double error_tol = 1.0e-13) const;
+
+  //! Evaluate elongation kappa at normalized radius r_norm
+  //! \param r_norm Normalized minor radius r/a
+  //! \return Elongation kappa(r_norm)
+  double get_elongation(double r_norm) const;
+
+  //! Evaluate triangularity delta at normalized radius r_norm
+  //! \param r_norm Normalized minor radius r/a
+  //! \return Triangularity delta(r_norm)
+  double get_triangularity(double r_norm) const;
 
   //! Sample energy from the distribution(s)
   //! \param r_norm Normalized minor radius r/a (for distribution selection)
@@ -343,6 +382,15 @@ private:
   //==========================================================================
   // Data members
 
+  // Mode flag
+  bool is_profile_ {false}; //!< True if using 1D profiles for kappa/delta
+
+    // Profile data (used when is_profile_ == true, size matching r_over_a_)
+  vector<double> elongation_profile_;     //!< kappa(r/a) profile
+  vector<double> elongation_prime_;       //!< dkappa/d(r/a) derivative profile
+  vector<double> triangularity_profile_;  //!< delta(r/a) profile
+  vector<double> triangularity_prime_;    //!< ddelta/d(r/a) derivative profile
+  
   // Emission profile (input)
   vector<double> r_over_a_;         //!< Normalized minor radius grid points
   vector<double> emission_density_; //!< Emission density S(r) at grid points
@@ -359,8 +407,8 @@ private:
   // Tokamak geometry parameters
   double major_radius_;    //!< Major radius R0 [cm]
   double minor_radius_;    //!< Minor radius a [cm]
-  double elongation_;      //!< Elongation kappa
-  double triangularity_;   //!< Triangularity delta
+  double elongation_;      //!< Scalar elongation kappa
+  double triangularity_;   //!< Scalar triangularity delta
   double shafranov_shift_; //!< Shafranov shift Delta [cm]
   double vertical_shift_;  //!< Vertical shift of plasma center [cm]
 
@@ -394,6 +442,9 @@ private:
     poloidal_dists_; //!< Distributions for each basis function g_k(alpha)
   array<double, N_POLOIDAL_BASIS>
     poloidal_integrals_; //!< Integrals of g_k(alpha) over [0, pi]
+
+  // Precomputed Fourier series tabular distributions (profile mode): one per radial point
+  vector<unique_ptr<Tabular>> fourier_poloidal_dists_;
 };
 
 //==============================================================================

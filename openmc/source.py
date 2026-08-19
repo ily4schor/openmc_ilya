@@ -897,75 +897,73 @@ class FileSource(SourceBase):
 
         return cls(**kwargs)
 
-
 class TokamakSource(SourceBase):
     r"""A source representing neutron emission from a tokamak plasma.
 
     This source samples neutron positions from a tokamak plasma geometry using
     Miller-style flux surface parameterization. The user provides an emission
     profile S(r/a) as a function of normalized minor radius, along with one or
-    more energy distributions.
+    more energy distributions, and either scalar or profile-dependent elongation
+    and triangularity.
 
-    The flux surface parameterization is
+    The flux surface parameterization is:
 
     .. math::
 
         \begin{aligned}
-        R &= R_0 + r \cos\left(\alpha + \delta \sin\alpha\right)
-             + \Delta \left[1 - \left(\frac{r}{a}\right)^2\right] \\
-        Z &= Z_\mathrm{shift} + \kappa r \sin\alpha
+        R(r, \alpha) &= R_0 + r \cos\left(\alpha + \delta(r) \sin\alpha\right)
+                     + \Delta \left[1 - \left(\frac{r}{a}\right)^2\right] \\
+        Z(r, \alpha) &= Z_\mathrm{shift} + \kappa(r) r \sin\alpha
         \end{aligned}
 
-    where :math:`R_0` is major radius, :math:`a` is minor radius,
-    :math:`\kappa` is elongation, :math:`\delta` is triangularity,
+    where :math:`R_0` is the major radius, :math:`a` is the minor radius,
+    :math:`\kappa(r)` is the plasma elongation (scalar or 1D profile),
+    :math:`\delta(r)` is the plasma triangularity (scalar or 1D profile),
     :math:`\Delta` is the Shafranov shift, and :math:`Z_\mathrm{shift}` is
     the vertical shift.
-
-    .. versionadded:: 0.16.0
 
     Parameters
     ----------
     major_radius : float
-        Major radius R0 in [cm]
+        Major radius R0 in [cm] (must be > 0)
     minor_radius : float
-        Minor radius a in [cm]
-    elongation : float
-        Plasma elongation κ (must be > 0)
-    triangularity : float
-        Plasma triangularity δ (must be in [-1, 1])
+        Minor radius a in [cm] (must be > 0 and < major_radius)
+    elongation : float or Sequence[float]
+        Plasma elongation κ (must be > 0). Can be provided as a single scalar
+        or as a 1D array of values corresponding to each ``r_over_a`` grid point.
+    triangularity : float or Sequence[float]
+        Plasma triangularity δ (must be in [-1, 1]). Can be provided as a single
+        scalar or as a 1D array of values corresponding to each ``r_over_a`` grid point.
     shafranov_shift : float
         Shafranov shift Δ in [cm] (must be >= 0 and < a/2)
-    r_over_a : numpy.ndarray
-        Normalized minor radius grid points, must start at 0 and end at 1
-    emission_density : numpy.ndarray
+    r_over_a : numpy.ndarray or Sequence[float]
+        Normalized minor radius grid points, must start at 0 and end at 1.
+    emission_density : numpy.ndarray or Sequence[float]
         Emission density S(r) at each r/a point (arbitrary units, must be >= 0).
-        Values are linearly interpolated between grid points and refined on an
-        internal grid for radial sampling. Must have the same length as
-        ``r_over_a`` and contain at least one positive value.
+        Must have the same length as ``r_over_a`` and contain at least one positive value.
     energy : openmc.stats.Univariate or Sequence[openmc.stats.Univariate]
         Energy distribution(s). Either a single distribution used at all radii,
-        or one distribution per ``r_over_a`` grid point. When one distribution
-        per grid point is given, the energy of a sampled particle is drawn from
-        one of the two distributions bracketing its sampled radius, selected
-        stochastically with probability proportional to the proximity of the
-        radius to each grid point (stochastic interpolation).
+        or one distribution per ``r_over_a`` grid point (stochastic interpolation).
+    method : {'fourier', 'bernstein'}, optional
+        Poloidal angle sampling algorithm (default: 'fourier'):
+        - 'fourier': Rejection-free Fourier-Bessel expansion supporting both scalar
+          and 1D profile inputs for elongation and triangularity.
+        - 'bernstein': 6-component Bernstein polynomial mixture sampling (requires
+          scalar elongation and triangularity).
     time : openmc.stats.Univariate, optional
-        Time distribution of the source. If None, particles are born at
-        :math:`t=0`, matching the default behavior of
-        :class:`openmc.IndependentSource`.
-    phi_start : float
-        Starting toroidal angle in [rad] (default: 0)
-    phi_extent : float
+        Time distribution of the source. If None, particles are born at :math:`t=0`.
+    phi_start : float, optional
+        Starting toroidal angle in [rad] (default: 0.0)
+    phi_extent : float, optional
         Toroidal angle extent in [rad] (default: 2π)
-    n_alpha : int
-        Number of poloidal angle grid points for CDF sampling (default: 101)
-    vertical_shift : float
-        Vertical shift of the plasma center in [cm] (default: 0)
-    strength : float
+    n_alpha : int, optional
+        Number of poloidal angle grid points for CDF tabulation (default: 101)
+    vertical_shift : float, optional
+        Vertical shift of the plasma center in [cm] (default: 0.0)
+    strength : float, optional
         Strength of the source (default: 1.0)
-    constraints : dict
-        Constraints on sampled source particles. See :class:`SourceBase` for
-        valid keys and values.
+    constraints : dict, optional
+        Constraints on sampled source particles. See :class:`SourceBase` for valid keys.
 
     Attributes
     ----------
@@ -973,10 +971,10 @@ class TokamakSource(SourceBase):
         Major radius R0 in [cm]
     minor_radius : float
         Minor radius a in [cm]
-    elongation : float
-        Plasma elongation κ
-    triangularity : float
-        Plasma triangularity δ
+    elongation : float or numpy.ndarray
+        Plasma elongation κ (scalar or 1D array)
+    triangularity : float or numpy.ndarray
+        Plasma triangularity δ (scalar or 1D array)
     shafranov_shift : float
         Shafranov shift Δ in [cm]
     r_over_a : numpy.ndarray
@@ -1001,19 +999,20 @@ class TokamakSource(SourceBase):
         Indicator of source type: 'tokamak'
     constraints : dict
         Constraints on sampled source particles
-
     """
+
 
     def __init__(
         self,
         major_radius: float,
         minor_radius: float,
-        elongation: float,
-        triangularity: float,
+        elongation: float | Sequence[float],
+        triangularity: float | Sequence[float],
         shafranov_shift: float,
         r_over_a: Sequence[float],
         emission_density: Sequence[float],
         energy: Univariate | Sequence[Univariate],
+        method: str = 'fourier',
         time: Univariate | None = None,
         phi_start: float = 0.0,
         phi_extent: float = 2.0 * np.pi,
@@ -1025,10 +1024,24 @@ class TokamakSource(SourceBase):
         super().__init__(strength=strength, constraints=constraints)
         self.major_radius = major_radius
         self.minor_radius = minor_radius
-        self.elongation = elongation
-        self.triangularity = triangularity
+        self.r_over_a = np.asarray(r_over_a)
         self.shafranov_shift = shafranov_shift
-        self.r_over_a = r_over_a
+        if method not in ('fourier', 'bernstein'):
+            raise ValueError(f"Invalid method '{method}'. Valid options are 'fourier' or 'bernstein'.")
+        if method == 'bernstein':
+            if isinstance(elongation, Iterable) or isinstance(triangularity, Iterable):
+                raise ValueError("Bernstein method requires scalar elongation and triangularity.")
+            self._is_profile = False
+            self.elongation = float(elongation)
+            self.triangularity = float(triangularity)
+        else:  # 'fourier' (default for both profiles and scalars)
+            self._is_profile = True
+            from scipy.interpolate import CubicSpline
+            self.elongation = np.asarray(elongation) if isinstance(elongation, Iterable) else np.full_like(self.r_over_a, float(elongation))
+            self.triangularity = np.asarray(triangularity) if isinstance(triangularity, Iterable) else np.full_like(self.r_over_a, float(triangularity))
+            bc = ((1, 0.0), 'not-a-knot')
+            self._kappa_prime = CubicSpline(self.r_over_a, self.elongation, bc_type=bc).derivative()(self.r_over_a)
+            self._delta_prime = CubicSpline(self.r_over_a, self.triangularity, bc_type=bc).derivative()(self.r_over_a)
         self.emission_density = emission_density
         self.phi_start = phi_start
         self.phi_extent = phi_extent
@@ -1060,6 +1073,14 @@ class TokamakSource(SourceBase):
                 f"Number of energy distributions ({len(self.energy)}) must be "
                 f"either 1 or equal to the number of r_over_a grid points "
                 f"({len(self.r_over_a)})")
+        if isinstance(self.elongation, np.ndarray) and len(self.elongation) != len(self.r_over_a):
+            raise ValueError(
+                f"elongation profile (length {len(self.elongation)}) must "
+                f"have the same length as r_over_a (length {len(self.r_over_a)})")
+        if isinstance(self.triangularity, np.ndarray) and len(self.triangularity) != len(self.r_over_a):
+            raise ValueError(
+                f"triangularity profile (length {len(self.triangularity)}) must "
+                f"have the same length as r_over_a (length {len(self.r_over_a)})")
 
     @property
     def type(self) -> str:
@@ -1086,25 +1107,37 @@ class TokamakSource(SourceBase):
         self._minor_radius = value
 
     @property
-    def elongation(self) -> float:
+    def elongation(self) -> float | np.ndarray:
         return self._elongation
 
     @elongation.setter
-    def elongation(self, value: float):
-        cv.check_type('elongation', value, Real)
-        cv.check_greater_than('elongation', value, 0.0)
-        self._elongation = value
+    def elongation(self, value: float | Sequence[float]):
+        if isinstance(value, Iterable):
+            val_arr = np.asarray(value, dtype=float)
+            if np.any(val_arr <= 0.0):
+                raise ValueError("elongation values must be > 0")
+            self._elongation = val_arr
+        else:
+            cv.check_type('elongation', value, Real)
+            cv.check_greater_than('elongation', value, 0.0)
+            self._elongation = float(value)
 
     @property
-    def triangularity(self) -> float:
+    def triangularity(self) -> float | np.ndarray:
         return self._triangularity
 
     @triangularity.setter
-    def triangularity(self, value: float):
-        cv.check_type('triangularity', value, Real)
-        cv.check_greater_than('triangularity', value, -1.0, equality=True)
-        cv.check_less_than('triangularity', value, 1.0, equality=True)
-        self._triangularity = value
+    def triangularity(self, value: float | Sequence[float]):
+        if isinstance(value, Iterable):
+            val_arr = np.asarray(value, dtype=float)
+            if np.any(val_arr < -1.0) or np.any(val_arr > 1.0):
+                raise ValueError("triangularity values must be in [-1, 1]")
+            self._triangularity = val_arr
+        else:
+            cv.check_type('triangularity', value, Real)
+            cv.check_greater_than('triangularity', value, -1.0, equality=True)
+            cv.check_less_than('triangularity', value, 1.0, equality=True)
+            self._triangularity = float(value)
 
     @property
     def shafranov_shift(self) -> float:
@@ -1225,8 +1258,14 @@ class TokamakSource(SourceBase):
         # Geometry parameters
         ET.SubElement(element, "major_radius").text = str(self.major_radius)
         ET.SubElement(element, "minor_radius").text = str(self.minor_radius)
-        ET.SubElement(element, "elongation").text = str(self.elongation)
-        ET.SubElement(element, "triangularity").text = str(self.triangularity)
+        if self._is_profile:
+            ET.SubElement(element, "elongation").text = ' '.join(str(k) for k in self.elongation)
+            ET.SubElement(element, "elongation_prime").text = ' '.join(str(kp) for kp in self._kappa_prime)
+            ET.SubElement(element, "triangularity").text = ' '.join(str(d) for d in self.triangularity)
+            ET.SubElement(element, "triangularity_prime").text = ' '.join(str(dp) for dp in self._delta_prime)
+        else:
+            ET.SubElement(element, "elongation").text = str(self.elongation)
+            ET.SubElement(element, "triangularity").text = str(self.triangularity)
         ET.SubElement(element, "shafranov_shift").text = str(self.shafranov_shift)
 
         # Toroidal angle bounds
@@ -1270,8 +1309,11 @@ class TokamakSource(SourceBase):
         # Read geometry parameters
         major_radius = float(get_text(elem, 'major_radius'))
         minor_radius = float(get_text(elem, 'minor_radius'))
-        elongation = float(get_text(elem, 'elongation'))
-        triangularity = float(get_text(elem, 'triangularity'))
+        elong_txt = get_text(elem, 'elongation').split()
+        elongation = [float(x) for x in elong_txt] if len(elong_txt) > 1 else float(elong_txt[0])
+        triang_txt = get_text(elem, 'triangularity').split()
+        triangularity = [float(x) for x in triang_txt] if len(triang_txt) > 1 else float(triang_txt[0])
+
         shafranov_shift = float(get_text(elem, 'shafranov_shift'))
 
         # Read optional parameters
