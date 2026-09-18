@@ -1364,7 +1364,1232 @@ class TokamakSource(SourceBase):
             strength=strength,
             constraints=constraints
         )
+    
+    @classmethod
+    def from_profiles(
+        cls,
+        r_over_a: Sequence[float],
+        temperature: Sequence[float],
+        density_D: Sequence[float],
+        density_T: Sequence[float],
+        major_radius: float,
+        minor_radius: float,
+        elongation: float | Sequence[float],
+        triangularity: float | Sequence[float],
+        shafranov_shift: float = 0.0,
+        reaction: str = 'DT',
+        method: str = 'fourier',
+        time: Univariate | None = None,
+        phi_start: float = 0.0,
+        phi_extent: float = 2.0 * np.pi,
+        n_alpha: int = 101,
+        vertical_shift: float = 0.0,
+        strength: float = 1.0,
+        constraints: dict[str, Any] | None = None
+    ) -> TokamakSource:
 
+        """Create a TokamakSource from 1D plasma profiles on the normalized minor radius grid.
+
+        Parameters
+        ----------
+        r_over_a : Sequence[float]
+            Normalized minor radius grid points (r_tilde = r/a), from 0.0 to 1.0.
+        temperature : Sequence[float]
+            Ion temperature profile T_i in [eV] on the ``r_over_a`` grid.
+        density_D : Sequence[float]
+            Deuterium ion density profile n_D in [m^-3] on the ``r_over_a`` grid.
+        density_T : Sequence[float]
+            Tritium ion density profile n_T in [m^-3] on the ``r_over_a`` grid.
+        major_radius : float
+            Major radius R0 in [cm] (must be > 0)
+        minor_radius : float
+            Minor radius a in [cm] (must be > 0 and < major_radius)
+        elongation : float or Sequence[float]
+            Plasma elongation κ (scalar or 1D array on ``r_over_a``)
+        triangularity : float or Sequence[float]
+            Plasma triangularity δ (scalar or 1D array on ``r_over_a``)
+        shafranov_shift : float, optional
+            Shafranov shift Δ in [cm] (default: 0.0)
+        reaction : {'DT', 'DD', 'TT'}, optional
+            Fusion reaction type (default: 'DT')
+        method : {'fourier', 'bernstein'}, optional
+            Poloidal angle sampling algorithm (default: 'fourier')
+        time : openmc.stats.Univariate, optional
+            Time distribution of the source. If None, particles are born at t=0.
+        phi_start : float, optional
+            Starting toroidal angle in [rad] (default: 0.0)
+        phi_extent : float, optional
+            Toroidal angle extent in [rad] (default: 2π)
+        n_alpha : int, optional
+            Number of poloidal angle grid points (default: 101)
+        vertical_shift : float, optional
+            Vertical shift of the plasma center in [cm] (default: 0.0)
+        strength : float, optional
+            Strength of the source (default: 1.0)
+        constraints : dict, optional
+            Constraints on sampled source particles.
+
+        Returns
+        -------
+        TokamakSource
+            Initialized TokamakSource with calculated emission density and
+            energy distributions.
+        """
+        r_arr = np.asarray(r_over_a, dtype=float)
+        T_arr = np.asarray(temperature, dtype=float)
+        nD_arr = np.asarray(density_D, dtype=float)
+        nT_arr = np.asarray(density_T, dtype=float)
+
+        if len(T_arr) != len(r_arr) or len(nD_arr) != len(r_arr) or len(nT_arr) != len(r_arr):
+            raise ValueError(
+                f"Length mismatch: temperature ({len(T_arr)}), density_D ({len(nD_arr)}), "
+                f"and density_T ({len(nT_arr)}) must match r_over_a ({len(r_arr)})"
+            )
+
+        # 1. Calculate Bosch-Hale volumetric fusion emissivity S(r)
+        emission_density = cls._calculate_fusion_emissivity(nD_arr, nT_arr, T_arr, reaction=reaction)
+
+        # 2. Calculate Ballabio Doppler-broadened energy distribution per radial point
+        if reaction in ('DT', 'DD'):
+            energy_dist = cls._ballabio_energy_spectrum(T_arr, reaction=reaction)
+        elif reaction == 'TT':
+            energy_dist = cls._get_tt_energy_spectrum()
+        else:
+            energy_dist = cls._ballabio_energy_spectrum(T_arr, reaction='DT')
+
+        return cls(
+            major_radius=major_radius,
+            minor_radius=minor_radius,
+            elongation=elongation,
+            triangularity=triangularity,
+            shafranov_shift=shafranov_shift,
+            r_over_a=r_arr,
+            emission_density=emission_density,
+            energy=energy_dist,
+            method=method,
+            time=time,
+            phi_start=phi_start,
+            phi_extent=phi_extent,
+            n_alpha=n_alpha,
+            vertical_shift=vertical_shift,
+            strength=strength,
+            constraints=constraints
+        )
+
+    @staticmethod
+    def _bosch_hale_reactivity(T_i: float | np.ndarray, reaction: str = 'DT') -> float | np.ndarray:
+        """Calculates fusion reactivity <sigma*v> in m^3/s using Bosch-Hale parameterization."""
+        T_ev = np.asarray(T_i, dtype=float)
+        T_kev = np.maximum(T_ev / 1000.0, 1e-6)
+
+        PARAMS = {
+            'DT': {
+                'BG': 34.3827, 'mrc2': 1124656.0, 'C1': 1.17302e-9,
+                'C2': 1.51361e-2, 'C3': 7.51886e-2, 'C4': 4.60643e-3,
+                'C5': 1.35000e-2, 'C6': -1.06750e-4, 'C7': 1.36600e-5
+            },
+            'DD_n': {
+                'BG': 31.3970, 'mrc2': 937814.0, 'C1': 5.43360e-12,
+                'C2': 5.85778e-3, 'C3': 7.68222e-3, 'C4': 0.0,
+                'C5': -2.96400e-6, 'C6': 0.0, 'C7': 0.0
+            },
+            'DD_p': {
+                'BG': 31.3970, 'mrc2': 937814.0, 'C1': 5.65718e-12,
+                'C2': 3.41267e-3, 'C3': 1.99167e-3, 'C4': 0.0,
+                'C5': 1.05060e-5, 'C6': 0.0, 'C7': 0.0
+            },
+            'TT': {
+                'BG': 38.6300, 'mrc2': 1409120.0, 'C1': 3.43470e-12,
+                'C2': 6.09650e-3, 'C3': 1.07750e-2, 'C4': 0.0,
+                'C5': -1.22270e-5, 'C6': 0.0, 'C7': 0.0
+            }
+        }
+
+        if reaction == 'DD':
+            return TokamakSource._bosch_hale_reactivity(T_i, 'DD_n') + TokamakSource._bosch_hale_reactivity(T_i, 'DD_p')
+
+        if reaction not in PARAMS:
+            raise ValueError(f"Unknown reaction '{reaction}'. Valid options: 'DT', 'DD', 'DD_n', 'DD_p', 'TT'")
+
+        p = PARAMS[reaction]
+        num = T_kev * (p['C2'] + T_kev * (p['C4'] + T_kev * p['C6']))
+        den = 1.0 + T_kev * (p['C3'] + T_kev * (p['C5'] + T_kev * p['C7']))
+        theta = T_kev / (1.0 - num / den)
+
+        xi = (p['BG']**2 / (4.0 * theta))**(1.0 / 3.0)
+        sigmav_cm3_s = p['C1'] * theta * np.sqrt(xi / (p['mrc2'] * T_kev**3)) * np.exp(-3.0 * xi)
+        return np.maximum(0.0, sigmav_cm3_s * 1e-6)
+
+    @staticmethod
+    def _calculate_fusion_emissivity(
+        nD: np.ndarray,
+        nT: np.ndarray,
+        Ti: np.ndarray,
+        reaction: str = 'DT'
+    ) -> np.ndarray:
+        """Calculates volumetric fusion emission density S(r) in neutrons / m^3 / s."""
+        nD_arr = np.asarray(nD, dtype=float)
+        nT_arr = np.asarray(nT, dtype=float)
+        Ti_arr = np.asarray(Ti, dtype=float)
+
+        if reaction == 'DT':
+            return nD_arr * nT_arr * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DT')
+        elif reaction == 'DD':
+            return 0.5 * (nD_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DD')
+        elif reaction == 'DD_n':
+            return 0.5 * (nD_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DD_n')
+        elif reaction == 'DD_p':
+            return 0.5 * (nD_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DD_p')
+        elif reaction == 'TT':
+            return 0.5 * (nT_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'TT')
+        else:
+            raise ValueError(f"Invalid reaction '{reaction}'. Valid options: 'DT', 'DD', 'DD_n', 'DD_p', 'TT'")
+
+    @staticmethod
+    def _ballabio_energy_spectrum(T_i: float | Sequence[float], reaction: str = 'DT') -> Any:
+        """Generates Ballabio relativistic Gaussian distributions (openmc.stats.Normal)."""
+        T_i_arr = np.asarray(T_i, dtype=float)
+        T_kev = np.maximum(T_i_arr * 1e-3, 1e-6)
+
+        if reaction == 'DD':
+            E_0 = 2449734.0
+            w0 = 82.542
+            a1, a2, a3, a4 = 4.69515, -0.040729, 0.47, 0.81844
+            b1, b2, b3, b4 = 1.7013e-3, 0.16888, 0.49, 7.9460e-4
+            a5, a6 = 18.225, 2.1525
+            b5, b6 = 8.4619e-3, 8.3241e-4
+        elif reaction == 'DT':
+            E_0 = 14028448.0
+            w0 = 177.259
+            a1, a2, a3, a4 = 5.30509, 2.4736e-3, 1.84, 1.3818
+            b1, b2, b3, b4 = 5.1068e-4, 7.6223e-3, 1.78, 8.7691e-5
+            a5, a6 = 37.771, 0.92181
+            b5, b6 = 2.0199e-3, 5.9501e-5
+        else:
+            raise ValueError("Invalid reaction for Ballabio spectrum. Choose 'DT' or 'DD'.")
+
+        low_mask = (T_kev <= 40.0)
+        Delta_E = np.where(low_mask, a1 / (1.0 + a2 * T_kev**a3) * T_kev**(2.0/3.0) + a4 * T_kev, a5 + a6 * T_kev)
+        delta_w = np.where(low_mask, b1 / (1.0 + b2 * T_kev**b3) * T_kev**(2.0/3.0) + b4 * T_kev, b5 + b6 * T_kev)
+
+        mean_eV = E_0 + Delta_E * 1e3
+        fwhm_eV = (w0 * (1.0 + delta_w) * np.sqrt(T_kev)) * 1e3
+        sigma_eV = fwhm_eV / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+
+        if T_i_arr.ndim == 0:
+            return openmc.stats.Normal(float(mean_eV), float(sigma_eV))
+        elif T_i_arr.ndim == 1:
+            return [openmc.stats.Normal(float(m), float(s)) for m, s in zip(mean_eV, sigma_eV)]
+
+    @staticmethod
+    def _get_tt_energy_spectrum() -> openmc.stats.Tabular:
+        """Returns continuous Tabular spectrum for the T(t, 2n)alpha 3-body continuum."""
+        tt_energies = np.linspace(1e4, 9.5e6, 100)
+        tt_pdf = (tt_energies / 9.5e6) * (1.0 - (tt_energies / 9.5e6))**2
+        trapz_fn = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
+        tt_pdf /= trapz_fn(tt_pdf, tt_energies)
+        return openmc.stats.Tabular(tt_energies, tt_pdf, interpolation='linear-linear')
+
+    @classmethod
+    def from_imas(
+        cls,
+        imas_input: Any,
+        reaction: str = 'DT',
+        n_points: int = 101,
+        method: str = 'fourier',
+        time: Univariate | None = None,
+        phi_start: float = 0.0,
+        phi_extent: float = 2.0 * np.pi,
+        n_alpha: int = 101,
+        vertical_shift: float = 0.0,
+        strength: float = 1.0,
+        constraints: dict[str, Any] | None = None
+    ) -> TokamakSource:
+        """Create a deterministic TokamakSource directly from an IMAS equilibrium and core profiles.
+
+        Parameters
+        ----------
+        imas_input : str or omas.ODS
+            Path to an IMAS file (.nc, .h5) or an existing OMAS ODS object.
+        reaction : {'DT', 'DD', 'TT'}, optional
+            Fusion reaction type (default: 'DT').
+        n_points : int, optional
+            Number of radial grid points for the uniform r_over_a grid (default: 101).
+        method : {'fourier', 'bernstein'}, optional
+            Poloidal angle sampling algorithm (default: 'fourier').
+        time : openmc.stats.Univariate, optional
+            Time distribution of the source. If None, particles are born at t=0.
+        phi_start : float, optional
+            Starting toroidal angle in [rad] (default: 0.0).
+        phi_extent : float, optional
+            Toroidal angle extent in [rad] (default: 2π).
+        n_alpha : int, optional
+            Number of poloidal angle grid points (default: 101).
+        vertical_shift : float, optional
+            Vertical shift of the plasma center in [cm] (default: 0.0).
+        strength : float, optional
+            Strength of the source (default: 1.0).
+        constraints : dict, optional
+            Constraints on sampled source particles.
+
+        Returns
+        -------
+        TokamakSource
+            Initialized TokamakSource with calculated emission density and
+            energy distributions.
+        """
+        ods = cls._load_ods(imas_input)
+        data = cls._extract_and_map_imas_profiles(ods, n_points=n_points)
+
+        return cls.from_profiles(
+            r_over_a=data['r_over_a'],
+            temperature=data['temperature'],
+            density_D=data['density_D'],
+            density_T=data['density_T'],
+            major_radius=data['major_radius'],
+            minor_radius=data['minor_radius'],
+            elongation=data['elongation'],
+            triangularity=data['triangularity'],
+            shafranov_shift=data['shafranov_shift'],
+            reaction=reaction,
+            method=method,
+            time=time,
+            phi_start=phi_start,
+            phi_extent=phi_extent,
+            n_alpha=n_alpha,
+            vertical_shift=vertical_shift,
+            strength=strength,
+            constraints=constraints
+        )
+    
+    @staticmethod
+    def _load_ods(imas_input: Any) -> Any:
+        """Loads an IMAS ODS from file path or returns existing ODS instance."""
+        try:
+            from omas import ODS, load_omas_h5, load_omas_nc
+        except ImportError:
+            raise ImportError(
+                "The 'omas' package is required for IMAS data extraction. "
+                "Install it via: pip install omas"
+            )
+
+        if isinstance(imas_input, ODS):
+            return imas_input
+
+        path = Path(imas_input)
+        if not path.is_file():
+            raise FileNotFoundError(f"File not found: '{path}'")
+
+        ext = path.suffix.lower()
+        if ext == '.nc':
+            return load_omas_nc(str(path))
+        elif ext in ('.h5', '.hdf5'):
+            return load_omas_h5(str(path))
+        else:
+            raise ValueError("Unsupported file extension. Expected '.nc', '.h5', or '.hdf5'.")
+
+    @staticmethod
+    def _extract_and_map_imas_profiles(ods: Any, n_points: int = 101) -> Dict[str, Any]:
+        """Extracts 1D profiles and geometry from IMAS and maps to a uniform r_over_a grid."""
+        from scipy.interpolate import PchipInterpolator
+
+        cp = ods['core_profiles']['profiles_1d'][0]
+        eq = ods['equilibrium']['time_slice'][0]['profiles_1d']
+
+        # 1. 1D boundary radii and geometric mapping r_tilde(rho)
+        if 'r_inboard' in eq and 'r_outboard' in eq:
+            r_in = np.asarray(eq['r_inboard'], dtype=float)
+            r_out = np.asarray(eq['r_outboard'], dtype=float)
+            r_geom = 0.5 * (r_out - r_in)
+            a_minor = float(r_geom[-1])
+            r_tilde_mapped = r_geom / a_minor
+            R0 = float(0.5 * (r_out[-1] + r_in[-1]))
+        else:
+            R0 = 3.3
+            a_minor = 1.13
+            rho_raw = np.asarray(cp['grid']['rho_tor_norm'], dtype=float)
+            r_tilde_mapped = rho_raw.copy()
+
+        # Convert to cm for OpenMC (IMAS stores meters)
+        # Note: If IMAS is in meters, multiply by 100 to get cm for OpenMC
+        # If already in cm (R0 > 20), keep as-is
+        scale_to_cm = 100.0 if R0 < 20.0 else 1.0
+        major_radius_cm = R0 * scale_to_cm
+        minor_radius_cm = a_minor * scale_to_cm
+
+        r_over_a = np.linspace(0.0, 1.0, n_points)
+
+        # 2. Resample Mean Profiles using PCHIP
+        T_mean_raw = np.asarray(cp['t_i_average'], dtype=float)
+        nD_mean_raw = np.asarray(cp['ion'][0]['density'], dtype=float)
+        nT_mean_raw = np.asarray(cp['ion'][1]['density'], dtype=float)
+
+        temperature = np.maximum(0.0, PchipInterpolator(r_tilde_mapped, T_mean_raw)(r_over_a))
+        density_D = np.maximum(0.0, PchipInterpolator(r_tilde_mapped, nD_mean_raw)(r_over_a))
+        density_T = np.maximum(0.0, PchipInterpolator(r_tilde_mapped, nT_mean_raw)(r_over_a))
+
+        # 3. Geometry Profiles
+        kappa_raw = np.asarray(eq['elongation'], dtype=float) if 'elongation' in eq else np.full_like(r_tilde_mapped, 1.0)
+        elongation = np.maximum(1.0, PchipInterpolator(r_tilde_mapped, kappa_raw)(r_over_a))
+
+        if 'triangularity_upper' in eq and 'triangularity_lower' in eq:
+            delta_u = np.asarray(eq['triangularity_upper'], dtype=float)
+            delta_l = np.asarray(eq['triangularity_lower'], dtype=float)
+            if not np.allclose(delta_u, delta_l, atol=1e-3):
+                warnings.warn(
+                    "OpenMC TokamakSource currently assumes up-down symmetric Miller geometry. "
+                    "Upper and lower triangularities differ; averaging them: delta = (delta_u + delta_l)/2.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            delta_raw = 0.5 * (delta_u + delta_l)
+        elif 'triangularity' in eq:
+
+            delta_raw = np.asarray(eq['triangularity'], dtype=float)
+        else:
+            delta_raw = np.zeros_like(r_tilde_mapped)
+
+        triangularity = PchipInterpolator(r_tilde_mapped, delta_raw)(r_over_a)
+        triangularity[0] = 0.0  # Triangularity vanishes at the core axis
+
+        if 'geometric_axis.r' in eq:
+            R_axis = np.asarray(eq['geometric_axis.r'], dtype=float)
+            shafranov_shift = float(R_axis[0] - R0) * scale_to_cm
+        else:
+            shafranov_shift = 0.0
+        shafranov_shift = max(0.0, shafranov_shift)
+
+        return {
+            'r_over_a': r_over_a,
+            'temperature': temperature,
+            'density_D': density_D,
+            'density_T': density_T,
+            'major_radius': major_radius_cm,
+            'minor_radius': minor_radius_cm,
+            'elongation': elongation,
+            'triangularity': triangularity,
+            'shafranov_shift': shafranov_shift,
+        }
+
+class TokamakSourceEnsemble:
+    """An ensemble representing stochastic realizations of a tokamak plasma source for Uncertainty Quantification (UQ).
+
+    This class manages Monte Carlo realizations of tokamak plasma profiles (ion temperature,
+    deuterium density, tritium density) and simultaneously evaluates all three primary fusion
+    reaction channels:
+    1. D-T: D + T -> n (14.1 MeV) + alpha (3.5 MeV)
+    2. D-D: D + D -> n (2.45 MeV) + He-3 (0.82 MeV)
+    3. T-T: T + T -> 2n (continuum up to 9.5 MeV) + alpha (3.5 MeV)
+
+    Each realization in the ensemble represents an independent physical state of the tokamak
+    plasma core, accounting for epistemic uncertainties in temperature and density measurements
+    or transport models (e.g. from IMAS covariance matrices decomposed via Karhunen-Loeve expansion).
+
+    The spatial flux surfaces for every realization are parameterized by:
+
+        R(r, alpha) = R_0 + r * cos(alpha + delta(r) * sin(alpha)) + Delta * [1 - (r/a)^2]
+        Z(r, alpha) = Z_shift + kappa(r) * r * sin(alpha)
+
+    where R_0 is the major radius, a is the minor radius, kappa(r) is the plasma elongation,
+    delta(r) is the plasma triangularity, Delta is the Shafranov shift, and Z_shift is the vertical shift.
+
+    Total neutron source strength for each reaction channel and realization is calculated using 2D Miller volume integration:
+
+        I_reaction = int_0^1 S_reaction(r) * (dV/dr) * dr
+
+    where S_reaction(r) is the volumetric fusion emissivity (neutrons / m^3 / s) evaluated using
+    Bosch-Hale parameterization, and dV/dr is the differential volume element in m^3.
+
+    Parameters
+    ----------
+    major_radius : float
+        Major radius R0 in [cm] (must be > 0).
+    minor_radius : float
+        Minor radius a in [cm] (must be > 0 and < major_radius).
+    elongation : float or Sequence[float]
+        Plasma elongation kappa (must be > 0). Can be provided as a single scalar
+        or as a 1D array of values corresponding to each ``r_over_a`` grid point.
+    triangularity : float or Sequence[float]
+        Plasma triangularity delta (must be in [-1, 1]). Can be provided as a single
+        scalar or as a 1D array of values corresponding to each ``r_over_a`` grid point.
+    r_over_a : Sequence[float]
+        Normalized minor radius grid points (r_tilde = r/a), strictly from 0.0 to 1.0.
+    temperature : Sequence[Sequence[float]]
+        Ensemble of ion temperature realizations T_i in [eV] of shape (n_samples, len(r_over_a)).
+    density_D : Sequence[Sequence[float]]
+        Ensemble of deuterium ion density realizations n_D in [m^-3] of shape (n_samples, len(r_over_a)).
+    density_T : Sequence[Sequence[float]]
+        Ensemble of tritium ion density realizations n_T in [m^-3] of shape (n_samples, len(r_over_a)).
+    shafranov_shift : float, optional
+        Shafranov shift Delta in [cm] (must be >= 0 and < a/2, default: 0.0).
+    emission_density_DT : Sequence[Sequence[float]], optional
+        Ensemble of D-T fusion emissivity profiles in [neutrons / m^3 / s].
+    emission_density_DD : Sequence[Sequence[float]], optional
+        Ensemble of D-D fusion emissivity profiles in [neutrons / m^3 / s].
+    emission_density_TT : Sequence[Sequence[float]], optional
+        Ensemble of T-T fusion emissivity profiles in [neutrons / m^3 / s].
+    energy_DT : Sequence[Sequence[openmc.stats.Univariate]], optional
+        Ensemble of radial Ballabio relativistic Doppler Gaussian distributions for D-T neutrons (~14.1 MeV).
+    energy_DD : Sequence[Sequence[openmc.stats.Univariate]], optional
+        Ensemble of radial Ballabio relativistic Doppler Gaussian distributions for D-D neutrons (~2.45 MeV).
+    energy_TT : openmc.stats.Tabular, optional
+        Tabular 3-body continuum distribution for T-T neutrons (0 to 9.5 MeV).
+    strength_DT : Sequence[float], optional
+        Integrated D-T source strength in [neutrons / s] for each realization.
+    strength_DD : Sequence[float], optional
+        Integrated D-D source strength in [neutrons / s] for each realization.
+    strength_TT : Sequence[float], optional
+        Integrated T-T source strength in [neutrons / s] for each realization.
+    method : {'fourier', 'bernstein'}, optional
+        Poloidal angle sampling algorithm (default: 'fourier').
+    time : openmc.stats.Univariate, optional
+        Time distribution of the source. If None, particles are born at t=0.
+    phi_start : float, optional
+        Starting toroidal angle in [rad] (default: 0.0).
+    phi_extent : float, optional
+        Toroidal angle extent in [rad] (default: 2*pi).
+    n_alpha : int, optional
+        Number of poloidal angle grid points for CDF tabulation (default: 101).
+    vertical_shift : float, optional
+        Vertical shift of the plasma center in [cm] (default: 0.0).
+    constraints : dict, optional
+        Constraints on sampled source particles.
+
+    Attributes
+    ----------
+    major_radius : float
+        Major radius R0 in [cm].
+    minor_radius : float
+        Minor radius a in [cm].
+    elongation : float or numpy.ndarray
+        Plasma elongation kappa (scalar or 1D array).
+    triangularity : float or numpy.ndarray
+        Plasma triangularity delta (scalar or 1D array).
+    shafranov_shift : float
+        Shafranov shift Delta in [cm].
+    r_over_a : numpy.ndarray
+        Normalized minor radius grid points in [0.0, 1.0].
+    temperature : numpy.ndarray
+        2D array of ion temperature realizations in [eV] of shape (n_samples, n_points).
+    density_D : numpy.ndarray
+        2D array of deuterium density realizations in [m^-3] of shape (n_samples, n_points).
+    density_T : numpy.ndarray
+        2D array of tritium density realizations in [m^-3] of shape (n_samples, n_points).
+    emission_density_DT : numpy.ndarray
+        2D array of D-T fusion emissivity realizations in [neutrons / m^3 / s].
+    emission_density_DD : numpy.ndarray
+        2D array of D-D fusion emissivity realizations in [neutrons / m^3 / s].
+    emission_density_TT : numpy.ndarray
+        2D array of T-T fusion emissivity realizations in [neutrons / m^3 / s].
+    emission_density : numpy.ndarray
+        2D array of total fusion emissivity realizations (DT + DD + TT) in [neutrons / m^3 / s].
+    energy_DT : list of list of openmc.stats.Univariate
+        Ensemble of radial D-T energy distributions.
+    energy_DD : list of list of openmc.stats.Univariate
+        Ensemble of radial D-D energy distributions.
+    energy_TT : openmc.stats.Tabular
+        Continuous Tabular T-T 3-body energy spectrum.
+    strength_DT : numpy.ndarray
+        1D array of integrated D-T source strengths in [neutrons / s] for each realization.
+    strength_DD : numpy.ndarray
+        1D array of integrated D-D source strengths in [neutrons / s] for each realization.
+    strength_TT : numpy.ndarray
+        1D array of integrated T-T source strengths in [neutrons / s] for each realization.
+    strengths : numpy.ndarray
+        1D array of total integrated source strengths (DT + DD + TT) in [neutrons / s] for each realization.
+    weight_DT : numpy.ndarray
+        1D array of normalized relative emission fractions for D-T fusion.
+    weight_DD : numpy.ndarray
+        1D array of normalized relative emission fractions for D-D fusion.
+    weight_TT : numpy.ndarray
+        1D array of normalized relative emission fractions for T-T fusion.
+    weights : numpy.ndarray
+        2D array of normalized reaction weights of shape (n_samples, 3).
+    mean_strength : float
+        Expected total source strength in [neutrons / s] across realizations.
+    std_strength : float
+        Standard deviation of total source strength in [neutrons / s] across realizations.
+    n_samples : int
+        Number of realizations in the ensemble.
+    """
+
+    def __init__(
+        self,
+        major_radius: float,
+        minor_radius: float,
+        elongation: float | Sequence[float],
+        triangularity: float | Sequence[float],
+        r_over_a: Sequence[float],
+        temperature: Sequence[Sequence[float]],
+        density_D: Sequence[Sequence[float]],
+        density_T: Sequence[Sequence[float]],
+        shafranov_shift: float = 0.0,
+        emission_density_DT: Sequence[Sequence[float]] | None = None,
+        emission_density_DD: Sequence[Sequence[float]] | None = None,
+        emission_density_TT: Sequence[Sequence[float]] | None = None,
+        energy_DT: Sequence[Sequence[Univariate]] | None = None,
+        energy_DD: Sequence[Sequence[Univariate]] | None = None,
+        energy_TT: Univariate | None = None,
+        strength_DT: Sequence[float] | None = None,
+        strength_DD: Sequence[float] | None = None,
+        strength_TT: Sequence[float] | None = None,
+        method: str = 'fourier',
+        time: Univariate | None = None,
+        phi_start: float = 0.0,
+        phi_extent: float = 2.0 * np.pi,
+        n_alpha: int = 101,
+        vertical_shift: float = 0.0,
+        constraints: dict[str, Any] | None = None
+    ):
+        self.major_radius = float(major_radius)
+        self.minor_radius = float(minor_radius)
+        self.r_over_a = np.asarray(r_over_a, dtype=float)
+        self.shafranov_shift = float(shafranov_shift)
+        self.elongation = np.asarray(elongation, dtype=float) if isinstance(elongation, Iterable) else float(elongation)
+        self.triangularity = np.asarray(triangularity, dtype=float) if isinstance(triangularity, Iterable) else float(triangularity)
+
+        self.temperature = np.asarray(temperature, dtype=float)
+        self.density_D = np.asarray(density_D, dtype=float)
+        self.density_T = np.asarray(density_T, dtype=float)
+
+        n_samples = len(self.temperature)
+        n_points = len(self.r_over_a)
+
+        # Dimension validation
+        if self.temperature.shape != (n_samples, n_points):
+            raise ValueError(
+                f"temperature shape {self.temperature.shape} must match (n_samples, n_points)=({n_samples}, {n_points})"
+            )
+        if self.density_D.shape != (n_samples, n_points):
+            raise ValueError(
+                f"density_D shape {self.density_D.shape} must match (n_samples, n_points)=({n_samples}, {n_points})"
+            )
+        if self.density_T.shape != (n_samples, n_points):
+            raise ValueError(
+                f"density_T shape {self.density_T.shape} must match (n_samples, n_points)=({n_samples}, {n_points})"
+            )
+
+        self.method = method
+        self.time = time
+        self.phi_start = phi_start
+        self.phi_extent = phi_extent
+        self.n_alpha = n_alpha
+        self.vertical_shift = vertical_shift
+        self.constraints = constraints
+
+        # 1. Compute or assign emission density profiles for DT, DD, TT
+        if emission_density_DT is None:
+            self.emission_density_DT = np.zeros((n_samples, n_points), dtype=float)
+            for i in range(n_samples):
+                self.emission_density_DT[i] = TokamakSource._calculate_fusion_emissivity(
+                    self.density_D[i], self.density_T[i], self.temperature[i], reaction='DT'
+                )
+        else:
+            self.emission_density_DT = np.asarray(emission_density_DT, dtype=float)
+
+        if emission_density_DD is None:
+            self.emission_density_DD = np.zeros((n_samples, n_points), dtype=float)
+            for i in range(n_samples):
+                self.emission_density_DD[i] = TokamakSource._calculate_fusion_emissivity(
+                    self.density_D[i], self.density_T[i], self.temperature[i], reaction='DD'
+                )
+        else:
+            self.emission_density_DD = np.asarray(emission_density_DD, dtype=float)
+
+        if emission_density_TT is None:
+            self.emission_density_TT = np.zeros((n_samples, n_points), dtype=float)
+            for i in range(n_samples):
+                self.emission_density_TT[i] = TokamakSource._calculate_fusion_emissivity(
+                    self.density_D[i], self.density_T[i], self.temperature[i], reaction='TT'
+                )
+        else:
+            self.emission_density_TT = np.asarray(emission_density_TT, dtype=float)
+
+        # Combined total emissivity profile
+        self.emission_density = self.emission_density_DT + self.emission_density_DD + self.emission_density_TT
+
+        # 2. Compute or assign radial energy distributions for DT, DD, TT
+        if energy_DT is None:
+            self.energy_DT = [
+                TokamakSource._ballabio_energy_spectrum(self.temperature[i], reaction='DT')
+                for i in range(n_samples)
+            ]
+        else:
+            self.energy_DT = list(energy_DT)
+
+        if energy_DD is None:
+            self.energy_DD = [
+                TokamakSource._ballabio_energy_spectrum(self.temperature[i], reaction='DD')
+                for i in range(n_samples)
+            ]
+        else:
+            self.energy_DD = list(energy_DD)
+
+        if energy_TT is None:
+            self.energy_TT = TokamakSource._get_tt_energy_spectrum()
+        else:
+            self.energy_TT = energy_TT
+
+        # 3. Compute or assign integrated source strengths in [neutrons / s]
+        if strength_DT is None:
+            self.strength_DT = np.array([
+                self._calculate_integrated_source_strength(
+                    self.emission_density_DT[i], self.r_over_a, self.major_radius,
+                    self.minor_radius, self.elongation, self.triangularity, self.shafranov_shift
+                ) for i in range(n_samples)
+            ], dtype=float)
+        else:
+            self.strength_DT = np.asarray(strength_DT, dtype=float)
+
+        if strength_DD is None:
+            self.strength_DD = np.array([
+                self._calculate_integrated_source_strength(
+                    self.emission_density_DD[i], self.r_over_a, self.major_radius,
+                    self.minor_radius, self.elongation, self.triangularity, self.shafranov_shift
+                ) for i in range(n_samples)
+            ], dtype=float)
+        else:
+            self.strength_DD = np.asarray(strength_DD, dtype=float)
+
+        if strength_TT is None:
+            self.strength_TT = np.array([
+                self._calculate_integrated_source_strength(
+                    self.emission_density_TT[i], self.r_over_a, self.major_radius,
+                    self.minor_radius, self.elongation, self.triangularity, self.shafranov_shift
+                ) for i in range(n_samples)
+            ], dtype=float)
+        else:
+            self.strength_TT = np.asarray(strength_TT, dtype=float)
+
+        # Total integrated source strength
+        self._strengths = self.strength_DT + self.strength_DD + self.strength_TT
+
+    def __len__(self) -> int:
+        """Returns the number of realizations in the ensemble."""
+        return len(self.temperature)
+
+    def __getitem__(self, index: int | slice) -> Any:
+        """Access a realization [source_DT, source_DD, source_TT] or slice a sub-ensemble."""
+        if isinstance(index, (int, np.integer)):
+            return self.sample(int(index))
+        elif isinstance(index, slice):
+            return TokamakSourceEnsemble(
+                major_radius=self.major_radius,
+                minor_radius=self.minor_radius,
+                elongation=self.elongation,
+                triangularity=self.triangularity,
+                r_over_a=self.r_over_a,
+                temperature=self.temperature[index],
+                density_D=self.density_D[index],
+                density_T=self.density_T[index],
+                shafranov_shift=self.shafranov_shift,
+                emission_density_DT=self.emission_density_DT[index],
+                emission_density_DD=self.emission_density_DD[index],
+                emission_density_TT=self.emission_density_TT[index],
+                energy_DT=self.energy_DT[index],
+                energy_DD=self.energy_DD[index],
+                energy_TT=self.energy_TT,
+                strength_DT=self.strength_DT[index],
+                strength_DD=self.strength_DD[index],
+                strength_TT=self.strength_TT[index],
+                method=self.method,
+                time=self.time,
+                phi_start=self.phi_start,
+                phi_extent=self.phi_extent,
+                n_alpha=self.n_alpha,
+                vertical_shift=self.vertical_shift,
+                constraints=self.constraints
+            )
+        else:
+            raise TypeError(f"Invalid index type: {type(index)}. Expected int or slice.")
+
+    def __iter__(self):
+        """Yields [source_DT, source_DD, source_TT] realization lists sequentially."""
+        for i in range(len(self)):
+            yield self.sample(i)
+
+    def sample(self, index: int, normalize_strength: bool = False) -> list[TokamakSource]:
+        """Constructs and returns the 3 TokamakSource objects [source_DT, source_DD, source_TT] for realization index.
+
+        Parameters
+        ----------
+        index : int
+            Index of the realization (0 <= index < len(ensemble)).
+        normalize_strength : bool, optional
+            If True, sets the source strengths to relative weights summing to 1.0.
+            If False (default), sets strengths to absolute neutron rates in neutrons / second.
+
+        Returns
+        -------
+        list of openmc.TokamakSource
+            List of 3 sources [source_DT, source_DD, source_TT] representing the simultaneous
+            fusion reaction channels for this realization.
+        """
+        if index < 0 or index >= len(self):
+            raise IndexError(f"Sample index {index} out of range for ensemble of size {len(self)}.")
+
+        tot = self._strengths[index] if normalize_strength and self._strengths[index] > 0 else 1.0
+        s_DT = float(self.strength_DT[index] / tot) if normalize_strength else float(self.strength_DT[index])
+        s_DD = float(self.strength_DD[index] / tot) if normalize_strength else float(self.strength_DD[index])
+        s_TT = float(self.strength_TT[index] / tot) if normalize_strength else float(self.strength_TT[index])
+
+        src_DT = TokamakSource(
+            major_radius=self.major_radius,
+            minor_radius=self.minor_radius,
+            elongation=self.elongation,
+            triangularity=self.triangularity,
+            shafranov_shift=self.shafranov_shift,
+            r_over_a=self.r_over_a,
+            emission_density=self.emission_density_DT[index],
+            energy=self.energy_DT[index],
+            method=self.method,
+            time=self.time,
+            phi_start=self.phi_start,
+            phi_extent=self.phi_extent,
+            n_alpha=self.n_alpha,
+            vertical_shift=self.vertical_shift,
+            strength=s_DT,
+            constraints=self.constraints
+        )
+
+        src_DD = TokamakSource(
+            major_radius=self.major_radius,
+            minor_radius=self.minor_radius,
+            elongation=self.elongation,
+            triangularity=self.triangularity,
+            shafranov_shift=self.shafranov_shift,
+            r_over_a=self.r_over_a,
+            emission_density=self.emission_density_DD[index],
+            energy=self.energy_DD[index],
+            method=self.method,
+            time=self.time,
+            phi_start=self.phi_start,
+            phi_extent=self.phi_extent,
+            n_alpha=self.n_alpha,
+            vertical_shift=self.vertical_shift,
+            strength=s_DD,
+            constraints=self.constraints
+        )
+
+        src_TT = TokamakSource(
+            major_radius=self.major_radius,
+            minor_radius=self.minor_radius,
+            elongation=self.elongation,
+            triangularity=self.triangularity,
+            shafranov_shift=self.shafranov_shift,
+            r_over_a=self.r_over_a,
+            emission_density=self.emission_density_TT[index],
+            energy=self.energy_TT,
+            method=self.method,
+            time=self.time,
+            phi_start=self.phi_start,
+            phi_extent=self.phi_extent,
+            n_alpha=self.n_alpha,
+            vertical_shift=self.vertical_shift,
+            strength=s_TT,
+            constraints=self.constraints
+        )
+
+        return [src_DT, src_DD, src_TT]
+
+    def sample_reaction(self, index: int, reaction: str = 'DT', normalize_strength: bool = False) -> TokamakSource:
+        """Constructs and returns a single TokamakSource realization for a specific reaction channel.
+
+        Parameters
+        ----------
+        index : int
+            Index of the realization.
+        reaction : {'DT', 'DD', 'TT', 'total'}
+            Reaction channel to sample.
+        normalize_strength : bool, optional
+            If True, sets strength = 1.0.
+
+        Returns
+        -------
+        openmc.TokamakSource
+            Initialized OpenMC TokamakSource for the specified reaction channel.
+        """
+        sources = self.sample(index, normalize_strength=normalize_strength)
+        if reaction == 'DT':
+            return sources[0]
+        elif reaction == 'DD':
+            return sources[1]
+        elif reaction == 'TT':
+            return sources[2]
+        elif reaction == 'total':
+            s_val = 1.0 if normalize_strength else float(self._strengths[index])
+            return TokamakSource(
+                major_radius=self.major_radius,
+                minor_radius=self.minor_radius,
+                elongation=self.elongation,
+                triangularity=self.triangularity,
+                shafranov_shift=self.shafranov_shift,
+                r_over_a=self.r_over_a,
+                emission_density=self.emission_density[index],
+                energy=self.energy_DT[index],
+                method=self.method,
+                time=self.time,
+                phi_start=self.phi_start,
+                phi_extent=self.phi_extent,
+                n_alpha=self.n_alpha,
+                vertical_shift=self.vertical_shift,
+                strength=s_val,
+                constraints=self.constraints
+            )
+        else:
+            raise ValueError(f"Invalid reaction '{reaction}'. Valid options: 'DT', 'DD', 'TT', 'total'.")
+
+    @property
+    def strengths(self) -> np.ndarray:
+        """Array of total integrated source strengths (DT + DD + TT) in [neutrons / s] for each realization."""
+        return self._strengths
+
+    @property
+    def mean_strength(self) -> float:
+        """Expected total source strength in [neutrons / s] across realizations."""
+        return float(np.mean(self._strengths))
+
+    @property
+    def std_strength(self) -> float:
+        """Standard deviation of total source strength in [neutrons / s] across realizations."""
+        return float(np.std(self._strengths, ddof=1)) if len(self) > 1 else 0.0
+
+    @property
+    def weight_DT(self) -> np.ndarray:
+        """Normalized emission weight fraction for D-T fusion per realization."""
+        tot = np.maximum(self._strengths, 1e-30)
+        return self.strength_DT / tot
+
+    @property
+    def weight_DD(self) -> np.ndarray:
+        """Normalized emission weight fraction for D-D fusion per realization."""
+        tot = np.maximum(self._strengths, 1e-30)
+        return self.strength_DD / tot
+
+    @property
+    def weight_TT(self) -> np.ndarray:
+        """Normalized emission weight fraction for T-T fusion per realization."""
+        tot = np.maximum(self._strengths, 1e-30)
+        return self.strength_TT / tot
+
+    @property
+    def weights(self) -> np.ndarray:
+        """2D array of normalized reaction weights (DT, DD, TT) of shape (n_samples, 3)."""
+        return np.column_stack((self.weight_DT, self.weight_DD, self.weight_TT))
+
+    @staticmethod
+    def _calculate_integrated_source_strength(
+        S_profile: np.ndarray,
+        r_over_a: np.ndarray,
+        major_radius: float,
+        minor_radius: float,
+        elongation: float | np.ndarray,
+        triangularity: float | np.ndarray,
+        shafranov_shift: float = 0.0
+    ) -> float:
+        """Calculates total neutron emission rate (neutrons / second) across the tokamak plasma volume.
+
+        Parameters
+        ----------
+        S_profile : numpy.ndarray
+            Volumetric fusion emissivity profile S(r) in [neutrons / m^3 / s].
+        r_over_a : numpy.ndarray
+            Normalized minor radius grid points in [0.0, 1.0].
+        major_radius : float
+            Major radius R0 in [cm] (or [m]).
+        minor_radius : float
+            Minor radius a in [cm] (or [m]).
+        elongation : float or numpy.ndarray
+            Plasma elongation kappa (scalar or 1D array on r_over_a).
+        triangularity : float or numpy.ndarray
+            Plasma triangularity delta (scalar or 1D array on r_over_a).
+        shafranov_shift : float, optional
+            Shafranov shift Delta in [cm] (or [m]).
+
+        Returns
+        -------
+        float
+            Total neutron emission rate in [neutrons / s].
+        """
+        from scipy.special import jv
+
+        # Convert dimensions to meters for volume element
+        R0_m = major_radius / 100.0 if major_radius > 20.0 else major_radius
+        a_m = minor_radius / 100.0 if minor_radius > 20.0 else minor_radius
+        shift_m = shafranov_shift / 100.0 if shafranov_shift > 20.0 else shafranov_shift
+
+        r_tilde = np.asarray(r_over_a, dtype=float)
+        eps = a_m / R0_m if R0_m > 0 else 0.0
+        delta_tilde = shift_m / a_m if a_m > 0 else 0.0
+
+        delta = np.asarray(triangularity, dtype=float)
+        kappa = np.asarray(elongation, dtype=float)
+
+        c0 = jv(0, delta) + jv(2, delta)
+        c1 = np.where(c0 > 0, (jv(1, 2.0 * delta) + jv(3, 2.0 * delta)) / c0, 0.0)
+
+        dV_dr = (4.0 * np.pi**2 * c0 * kappa * R0_m * a_m**2) * (
+            (1.0 + eps * delta_tilde) * r_tilde
+            - (3.0 / 8.0) * c1 * eps * r_tilde**2
+            - 2.0 * eps * delta_tilde * r_tilde**3
+        )
+
+        trapz_fn = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
+        strength_n_per_sec = float(trapz_fn(np.asarray(S_profile, dtype=float) * dV_dr, r_tilde))
+        return max(0.0, strength_n_per_sec)
+
+    @staticmethod
+    def _perform_kl_expansion(
+        cov_matrix: np.ndarray,
+        kl_components: int | float = 0.99
+    ) -> dict[str, Any]:
+        """Performs Karhunen-Loeve spectral decomposition on a covariance matrix."""
+        from scipy.linalg import eigh
+        cov = np.asarray(cov_matrix, dtype=float)
+        n_grid = cov.shape[0]
+
+        eigenvalues, eigenvectors = eigh(cov)
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+
+        total_var = np.sum(eigenvalues)
+        cum_var = np.cumsum(eigenvalues) / total_var if total_var > 0 else np.ones(n_grid)
+
+        if isinstance(kl_components, (int, np.integer)):
+            k_modes = min(int(kl_components), n_grid)
+        elif isinstance(kl_components, (float, np.floating)):
+            k_modes = int(np.searchsorted(cum_var, float(kl_components)) + 1)
+            k_modes = min(k_modes, n_grid)
+        else:
+            raise ValueError("kl_components must be an int or float.")
+
+        k_evals = eigenvalues[:k_modes]
+        k_evecs = eigenvectors[:, :k_modes]
+        mode_basis = k_evecs * np.sqrt(np.maximum(0.0, k_evals))
+
+        return {
+            'n_modes': k_modes,
+            'explained_variance_ratio': float(cum_var[k_modes - 1]),
+            'eigenvalues': k_evals,
+            'eigenvectors': k_evecs,
+            'mode_basis': mode_basis
+        }
+
+    @staticmethod
+    def _sample_kl_expansion(
+        mean_profile: np.ndarray,
+        mode_basis: np.ndarray,
+        n_samples: int = 100,
+        rng: np.random.Generator | None = None
+    ) -> np.ndarray:
+        """Generates stochastic realizations using the KL mode basis."""
+        mean_arr = np.asarray(mean_profile, dtype=float)
+        basis_arr = np.asarray(mode_basis, dtype=float)
+        k_modes = basis_arr.shape[1]
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        xi = rng.normal(loc=0.0, scale=1.0, size=(n_samples, k_modes))
+        samples = mean_arr + np.dot(xi, basis_arr.T)
+        return np.maximum(0.0, samples)
+
+    @classmethod
+    def from_imas(
+        cls,
+        imas_input: Any,
+        n_samples: int = 100,
+        kl_components: int | float = 0.99,
+        n_points: int = 101,
+        method: str = 'fourier',
+        time: Univariate | None = None,
+        phi_start: float = 0.0,
+        phi_extent: float = 2.0 * np.pi,
+        n_alpha: int = 101,
+        vertical_shift: float = 0.0,
+        random_seed: int | np.random.Generator | None = None,
+        constraints: dict[str, Any] | None = None
+    ) -> TokamakSourceEnsemble:
+        """Create a TokamakSourceEnsemble directly from an IMAS equilibrium and core profiles with covariance matrices.
+
+        This method performs the upfront coordinate transformation from flux coordinate rho
+        to normalized minor radius r_tilde before Karhunen-Loeve expansion by interpolating
+        eigenvector modes onto the regular r_tilde grid using CubicSpline.
+
+        Parameters
+        ----------
+        imas_input : str or omas.ODS
+            Path to an IMAS file (.nc, .h5) or an existing OMAS ODS object.
+        n_samples : int, optional
+            Number of Monte Carlo realizations to generate (default: 100).
+        kl_components : int or float, optional
+            Number of KL modes or cumulative variance threshold (default: 0.99).
+        n_points : int, optional
+            Number of radial grid points for the uniform r_over_a grid (default: 101).
+        method : {'fourier', 'bernstein'}, optional
+            Poloidal angle sampling algorithm (default: 'fourier').
+        time : openmc.stats.Univariate, optional
+            Time distribution of the source.
+        phi_start : float, optional
+            Starting toroidal angle in [rad] (default: 0.0).
+        phi_extent : float, optional
+            Toroidal angle extent in [rad] (default: 2*pi).
+        n_alpha : int, optional
+            Number of poloidal angle grid points (default: 101).
+        vertical_shift : float, optional
+            Vertical shift of the plasma center in [cm] (default: 0.0).
+        random_seed : int or numpy.random.Generator, optional
+            Random seed or generator for reproducible sampling.
+        constraints : dict, optional
+            Constraints on sampled source particles.
+
+        Returns
+        -------
+        TokamakSourceEnsemble
+            Initialized TokamakSourceEnsemble managing stochastic plasma realizations.
+        """
+        from scipy.interpolate import PchipInterpolator, CubicSpline
+
+        ods = TokamakSource._load_ods(imas_input)
+        cp = ods['core_profiles']['profiles_1d'][0]
+        eq = ods['equilibrium']['time_slice'][0]['profiles_1d']
+
+        # 1. 1D boundary radii and geometric mapping r_tilde(rho)
+        if 'r_inboard' in eq and 'r_outboard' in eq:
+            r_in = np.asarray(eq['r_inboard'], dtype=float)
+            r_out = np.asarray(eq['r_outboard'], dtype=float)
+            r_geom = 0.5 * (r_out - r_in)
+            a_minor = float(r_geom[-1])
+            r_tilde_mapped = r_geom / a_minor
+            R0 = float(0.5 * (r_out[-1] + r_in[-1]))
+        else:
+            R0 = 3.3
+            a_minor = 1.13
+            rho_raw = np.asarray(cp['grid']['rho_tor_norm'], dtype=float)
+            r_tilde_mapped = rho_raw.copy()
+
+        scale_to_cm = 100.0 if R0 < 20.0 else 1.0
+        major_radius_cm = R0 * scale_to_cm
+        minor_radius_cm = a_minor * scale_to_cm
+
+        r_over_a = np.linspace(0.0, 1.0, n_points)
+
+        # 2. Resample Mean Profiles using PCHIP
+        T_mean_raw = np.asarray(cp['t_i_average'], dtype=float)
+        nD_mean_raw = np.asarray(cp['ion'][0]['density'], dtype=float)
+        nT_mean_raw = np.asarray(cp['ion'][1]['density'], dtype=float)
+        ne_mean_raw = np.asarray(cp['electrons']['density'], dtype=float) if 'electrons' in cp else (nD_mean_raw + nT_mean_raw)
+
+        temperature_mean = np.maximum(0.0, PchipInterpolator(r_tilde_mapped, T_mean_raw)(r_over_a))
+        density_D_mean = np.maximum(0.0, PchipInterpolator(r_tilde_mapped, nD_mean_raw)(r_over_a))
+        density_T_mean = np.maximum(0.0, PchipInterpolator(r_tilde_mapped, nT_mean_raw)(r_over_a))
+
+        # 3. Extract Covariance Submatrices and Map via Eigenvector Mode Splines
+        if 'covariance' in ods['core_profiles'] and 'data' in ods['core_profiles']['covariance']:
+            full_cov = np.asarray(ods['core_profiles']['covariance']['data'], dtype=float)
+            rows_uri = [str(u) for u in ods['core_profiles']['covariance']['rows_uri']]
+
+            ne_idx = [i for i, u in enumerate(rows_uri) if 'electrons.density' in u]
+            ti_idx = [i for i, u in enumerate(rows_uri) if 't_i_average' in u]
+
+            cov_ne_raw = full_cov[np.ix_(ne_idx, ne_idx)] if len(ne_idx) > 0 else np.diag(0.01 * ne_mean_raw**2)
+            cov_Ti_raw = full_cov[np.ix_(ti_idx, ti_idx)] if len(ti_idx) > 0 else np.diag(0.01 * T_mean_raw**2)
+        else:
+            cov_ne_raw = np.diag(0.01 * ne_mean_raw**2)
+            cov_Ti_raw = np.diag(0.01 * T_mean_raw**2)
+
+        # Scale electron density covariance for D and T species
+        fD_raw = nD_mean_raw / np.maximum(ne_mean_raw, 1e-30)
+        fT_raw = nT_mean_raw / np.maximum(ne_mean_raw, 1e-30)
+        cov_nD_raw = np.outer(fD_raw, fD_raw) * cov_ne_raw
+        cov_nT_raw = np.outer(fT_raw, fT_raw) * cov_ne_raw
+
+        # KL expansion on raw rho coordinate
+        kl_T = cls._perform_kl_expansion(cov_Ti_raw, kl_components=kl_components)
+        kl_nD = cls._perform_kl_expansion(cov_nD_raw, kl_components=kl_components)
+        kl_nT = cls._perform_kl_expansion(cov_nT_raw, kl_components=kl_components)
+
+        # Interpolate mode eigenvectors onto regular r_over_a grid (guarantees positive semi-definiteness)
+        V_T_rtilde = CubicSpline(r_tilde_mapped, kl_T['eigenvectors'], axis=0)(r_over_a)
+        V_nD_rtilde = CubicSpline(r_tilde_mapped, kl_nD['eigenvectors'], axis=0)(r_over_a)
+        V_nT_rtilde = CubicSpline(r_tilde_mapped, kl_nT['eigenvectors'], axis=0)(r_over_a)
+
+        mode_basis_T_rtilde = V_T_rtilde * np.sqrt(np.maximum(0.0, kl_T['eigenvalues']))
+        mode_basis_nD_rtilde = V_nD_rtilde * np.sqrt(np.maximum(0.0, kl_nD['eigenvalues']))
+        mode_basis_nT_rtilde = V_nT_rtilde * np.sqrt(np.maximum(0.0, kl_nT['eigenvalues']))
+
+        # RNG Sub-seeds
+        if isinstance(random_seed, np.random.Generator):
+            main_rng = random_seed
+        elif random_seed is not None:
+            main_rng = np.random.default_rng(random_seed)
+        else:
+            main_rng = np.random.default_rng()
+
+        seed_T = main_rng.integers(0, 2**31 - 1)
+        seed_nD = main_rng.integers(0, 2**31 - 1)
+        seed_nT = main_rng.integers(0, 2**31 - 1)
+
+        T_ens = cls._sample_kl_expansion(
+            temperature_mean, mode_basis_T_rtilde, n_samples=n_samples, rng=np.random.default_rng(seed_T)
+        )
+        nD_ens = cls._sample_kl_expansion(
+            density_D_mean, mode_basis_nD_rtilde, n_samples=n_samples, rng=np.random.default_rng(seed_nD)
+        )
+        nT_ens = cls._sample_kl_expansion(
+            density_T_mean, mode_basis_nT_rtilde, n_samples=n_samples, rng=np.random.default_rng(seed_nT)
+        )
+
+        # 4. Geometry Profiles
+        kappa_raw = np.asarray(eq['elongation'], dtype=float) if 'elongation' in eq else np.full_like(r_tilde_mapped, 1.0)
+        elongation = np.maximum(1.0, PchipInterpolator(r_tilde_mapped, kappa_raw)(r_over_a))
+
+        if 'triangularity_upper' in eq and 'triangularity_lower' in eq:
+            delta_u = np.asarray(eq['triangularity_upper'], dtype=float)
+            delta_l = np.asarray(eq['triangularity_lower'], dtype=float)
+            if not np.allclose(delta_u, delta_l, atol=1e-3):
+                warnings.warn(
+                    "OpenMC TokamakSource currently assumes up-down symmetric Miller geometry. "
+                    "Upper and lower triangularities differ; averaging them: delta = (delta_u + delta_l)/2.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            delta_raw = 0.5 * (delta_u + delta_l)
+        elif 'triangularity' in eq:
+
+            delta_raw = np.asarray(eq['triangularity'], dtype=float)
+        else:
+            delta_raw = np.zeros_like(r_tilde_mapped)
+
+        triangularity = PchipInterpolator(r_tilde_mapped, delta_raw)(r_over_a)
+        triangularity[0] = 0.0
+
+        if 'geometric_axis.r' in eq:
+            R_axis = np.asarray(eq['geometric_axis.r'], dtype=float)
+            shafranov_shift = float(R_axis[0] - R0) * scale_to_cm
+        else:
+            shafranov_shift = 0.0
+        shafranov_shift = max(0.0, shafranov_shift)
+
+        return cls(
+            major_radius=major_radius_cm,
+            minor_radius=minor_radius_cm,
+            elongation=elongation,
+            triangularity=triangularity,
+            shafranov_shift=shafranov_shift,
+            r_over_a=r_over_a,
+            temperature=T_ens,
+            density_D=nD_ens,
+            density_T=nT_ens,
+            method=method,
+            time=time,
+            phi_start=phi_start,
+            phi_extent=phi_extent,
+            n_alpha=n_alpha,
+            vertical_shift=vertical_shift,
+            constraints=constraints
+        )
 
 class SourceParticle:
     """Source particle
