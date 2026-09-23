@@ -981,6 +981,196 @@ class Model:
 
         return last_statepoint
 
+    def run_uq(
+        self,
+        ensemble: Any,
+        batches: int | None = None,
+        particles: int | None = None,
+        n_realizations: int | None = None,
+        threads: int | None = None,
+        cwd: PathLike = "uq_runs",
+        keep_statepoints: bool = True,
+        output: bool = False,
+        openmc_exec: PathLike = "openmc",
+        **run_kwargs,
+    ) -> UQResult:
+        """Executes native OpenMC Uncertainty Quantification across an ensemble of plasma realizations.
+
+        Iterates through the realizations of a TokamakSourceEnsemble, runs an independent
+        simulation for each realization in an isolated subfolder, collects statepoint tallies,
+        and applies the Law of Total Variance.
+
+        Parameters
+        ----------
+        ensemble : openmc.TokamakSourceEnsemble
+            Ensemble managing stochastic plasma realizations.
+        batches : int, optional
+            Number of batches to run per realization. If None, uses existing model.settings.batches.
+        particles : int, optional
+            Number of particles per batch. If None, uses existing model.settings.particles.
+        n_realizations : int, optional
+            Number of realizations to evaluate. Defaults to len(ensemble).
+        threads : int, optional
+            Number of OpenMP threads to use.
+        cwd : PathLike, optional
+            Base working directory for UQ runs (default: 'uq_runs').
+        keep_statepoints : bool, optional
+            Whether to keep individual statepoint files on disk (default: True).
+            Set to False to save disk space.
+        output : bool, optional
+            Whether to display OpenMC standard output during each realization run (default: False).
+        openmc_exec : str, optional
+            Path to OpenMC executable. Defaults to 'openmc'.
+        **run_kwargs
+            Additional arguments passed to Model.run().
+
+        Returns
+        -------
+        UQResult
+            Aggregated UQ results containing tally statistics and Law of Total Variance decomposition.
+        """
+        import collections
+
+        if getattr(self.settings, 'run_mode', 'eigenvalue') != 'fixed source':
+            raise ValueError("Tokamak UQ requires model.settings.run_mode to be explicitly set to 'fixed source'.")
+
+        if not hasattr(ensemble, 'sample') or not hasattr(ensemble, 'strengths'):
+            raise TypeError("Expected 'ensemble' to be an instance of TokamakSourceEnsemble.")
+
+        total_available = len(ensemble)
+        if total_available == 0:
+            raise ValueError("The provided TokamakSourceEnsemble has 0 realizations.")
+
+        N = min(n_realizations, total_available) if n_realizations is not None else total_available
+
+        # Preserve original settings to restore upon completion
+        orig_source = self.settings.source
+        orig_batches = getattr(self.settings, 'batches', None)
+        orig_particles = getattr(self.settings, 'particles', None)
+        orig_inactive = getattr(self.settings, 'inactive', None)
+        orig_seed = getattr(self.settings, 'seed', None)
+
+        realization_means = collections.defaultdict(list)
+        realization_stds = collections.defaultdict(list)
+        tally_metadata = {}
+        strengths_evaluated = []
+
+        # Generate independent seeds for rigorous Monte Carlo UQ noise separation
+        # using the existing settings.seed (if present) as a reproducible master seed.
+        master_seed = orig_seed if orig_seed is not None else 42
+        rng = np.random.default_rng(seed=master_seed)
+        # OpenMC natively handles 64-bit integer seeds, but positive 63-bit is safest 
+        # across different platforms to avoid signed/unsigned casting issues.
+        max_seed = np.iinfo(np.int64).max
+        realization_seeds = rng.integers(low=1, high=max_seed, size=N)
+
+        try:
+            base_dir = Path("uq_runs" if cwd is None else cwd)
+            base_dir.mkdir(parents=True, exist_ok=True)
+
+            if batches is not None:
+                self.settings.batches = batches
+                # OpenMC will crash if inactive >= batches. Scale it down safely if overridden.
+                if orig_inactive is not None and self.settings.inactive >= batches:
+                    self.settings.inactive = max(0, batches - 1)
+            if particles is not None:
+                self.settings.particles = particles
+
+            print(f"Starting OpenMC UQ Execution: {N} realizations, {self.settings.batches} batches, {self.settings.particles} particles/batch...")
+
+            for k in range(N):
+                run_dir = base_dir / f"realization_{k:04d}"
+                run_dir.mkdir(parents=True, exist_ok=True)
+
+                # Assign the rigorously generated independent seed
+                self.settings.seed = int(realization_seeds[k])
+
+                # Assign the 3 sources (DT, DD, TT) for this realization
+                self.settings.source = ensemble.sample(k)
+                strengths_evaluated.append(float(ensemble.strengths[k]))
+
+                print(f"  -> [{k + 1}/{N}] Simulating realization {k} (strength: {ensemble.strengths[k]:.3e} n/s)...")
+
+                sp_path = self.run(
+                    threads=threads,
+                    output=output,
+                    cwd=run_dir,
+                    openmc_exec=openmc_exec,
+                    **run_kwargs
+                )
+
+                if sp_path is None or not Path(sp_path).exists():
+                    raise RuntimeError(f"Realization {k} failed to generate a statepoint file.")
+
+                # Extract tallies from statepoint
+                with openmc.StatePoint(str(sp_path)) as sp:
+                    
+                    # 1. Scan for duplicate names to prevent dictionary key collisions
+                    if k == 0:
+                        name_counts = collections.Counter(t.name for t in sp.tallies.values() if t.name)
+
+                    for t_id, tally in sp.tallies.items():
+                        
+                        # 2. Assign unique name (append ID if duplicate exists)
+                        if tally.name and name_counts[tally.name] > 1:
+                            t_name = f"{tally.name}_{t_id}"
+                        else:
+                            t_name = tally.name if tally.name else f"tally_{t_id}"
+
+                        if k == 0:
+                            # Extract native DataFrame structure to retain bin labels
+                            try:
+                                df_structure = tally.get_pandas_dataframe()
+                                if 'mean' in df_structure.columns:
+                                    df_structure = df_structure.drop(columns=['mean'])
+                                if 'std. dev.' in df_structure.columns:
+                                    df_structure = df_structure.drop(columns=['std. dev.'])
+                            except (ImportError, Exception):
+                                df_structure = None
+
+                            tally_metadata[t_name] = {
+                                'id': t_id,
+                                'scores': tally.scores,
+                                'filters': [type(f).__name__ for f in tally.filters],
+                                'df_structure': df_structure,
+                            }
+                        realization_means[t_name].append(np.array(tally.mean))
+                        realization_stds[t_name].append(np.array(tally.std_dev))
+
+                # Clean up HDF5 files if requested to conserve disk space
+                if not keep_statepoints:
+                    for f in [sp_path, run_dir / "summary.h5"]:
+                        try:
+                            if f and Path(f).exists():
+                                Path(f).unlink()
+                        except OSError:
+                            pass
+
+        finally:
+            # Restore model settings
+            if orig_source is not None:
+                self.settings.source = orig_source
+            if orig_batches is not None:
+                self.settings.batches = orig_batches
+            if orig_particles is not None:
+                self.settings.particles = orig_particles
+            if orig_inactive is not None:
+                self.settings.inactive = orig_inactive
+            if orig_seed is not None:
+                self.settings.seed = orig_seed
+            else:
+                self.settings._seed = None
+
+        print(f"✅ Completed UQ run across {N} realizations successfully!")
+
+        return UQResult(
+            realization_means=dict(realization_means),
+            realization_std_devs=dict(realization_stds),
+            strengths=strengths_evaluated,
+            tally_metadata=tally_metadata,
+        )
+
+    
     def calculate_volumes(
         self,
         threads: int | None = None,
@@ -3208,3 +3398,227 @@ class SearchResult:
     def total_batches(self) -> int:
         """Total number of active batches used across all evaluations."""
         return sum(self.batches)
+
+class UQResult:
+    """Container for Tokamak Plasma Uncertainty Quantification (UQ) results.
+
+    This class aggregates Monte Carlo tallies across an ensemble of plasma realizations
+    and applies the Law of Total Variance to cleanly separate Parameters (plasma profile)
+    variance from MC (Monte Carlo statistical) noise.
+
+    Supports three normalization modes:
+    1. 'nominal' (default): Normalizes physical quantities to the ensemble mean source
+       strength (y_nominal = y_k * (I_k / mean_I)). Retains units of 'per source particle'
+       while fully capturing the physical variance from fusion yield fluctuations.
+    2. 'per_particle' (or 'shape_only'): Standard OpenMC per-source-particle tally. Isolates
+       pure spatial profile peaking and Doppler spectral shifts.
+    3. 'absolute': Multiplies tallies by each realization's source strength (y_abs = y_k * I_k),
+       giving physical rates (e.g. Watts, MW, or reactions / second).
+
+    Parameters
+    ----------
+    realization_means : dict of str to numpy.ndarray
+        Dictionary mapping tally name/ID to realization mean arrays of shape (n_realizations, ...).
+    realization_std_devs : dict of str to numpy.ndarray
+        Dictionary mapping tally name/ID to realization MC std dev arrays of shape (n_realizations, ...).
+    strengths : Sequence of float
+        Total integrated source strength in [neutrons / s] for each realization.
+    tally_metadata : dict, optional
+        Metadata describing each tally (scores, filters, IDs).
+    """
+
+    def __init__(
+        self,
+        realization_means: dict[str, np.ndarray],
+        realization_std_devs: dict[str, np.ndarray],
+        strengths: Sequence[float],
+        tally_metadata: dict[str, Any] | None = None,
+    ):
+        self.tally_metadata = tally_metadata or {}
+        self.strengths = np.asarray(strengths, dtype=float)
+        self.n_realizations = len(self.strengths)
+        self.mean_strength = float(np.mean(self.strengths)) if self.n_realizations > 0 else 0.0
+        self.std_strength = float(np.std(self.strengths, ddof=1)) if self.n_realizations > 1 else 0.0
+
+        # Convert dictionary entries to 3D/nD numpy arrays of shape (N, ...)
+        self.realization_means = {
+            k: np.asarray(v, dtype=float) for k, v in realization_means.items()
+        }
+        self.realization_std_devs = {
+            k: np.asarray(v, dtype=float) for k, v in realization_std_devs.items()
+        }
+
+    def __getitem__(self, tally_name: str) -> dict[str, Any]:
+        """Convenient dictionary lookup returning nominal statistics for a tally."""
+        return self.get_tally(tally_name, mode='nominal')
+
+    def get_tally(self, tally_name: str, mode: str = 'nominal') -> dict[str, Any]:
+        """Calculates expected values and Law of Total Variance breakdown for a tally.
+
+        Parameters
+        ----------
+        tally_name : str
+            Name or ID string of the tally.
+        mode : {'nominal', 'per_particle', 'shape_only', 'absolute'}, optional
+            Normalization mode (default: 'nominal').
+
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - 'mean': Expected value array
+            - 'std_dev_total': Total combined standard deviation
+            - 'std_dev_parameters': Standard deviation from plasma profile shifts
+            - 'std_dev_mc': Standard deviation from Monte Carlo noise
+            - 'rel_total': Relative total uncertainty [%]
+            - 'rel_parameters': Relative parameters uncertainty [%]
+            - 'rel_mc': Relative MC uncertainty [%]
+            - 'parameters_share': Percentage of variance caused by plasma physics [%]
+            - 'samples': Array of realization outcomes (N, ...)
+        """
+        if tally_name not in self.realization_means:
+            raise KeyError(f"Tally '{tally_name}' not found. Available tallies: {list(self.realization_means.keys())}")
+
+        means = self.realization_means[tally_name]
+        stds = self.realization_std_devs[tally_name]
+        N = self.n_realizations
+
+        # Compute scaling weight factor for the requested mode
+        extra_dims = (1,) * (means.ndim - 1)
+        if mode in ('nominal', 'default'):
+            factor = (self.strengths / max(self.mean_strength, 1e-30)).reshape((-1,) + extra_dims)
+        elif mode in ('per_particle', 'shape_only'):
+            factor = np.ones((N,) + extra_dims)
+        elif mode == 'absolute':
+            factor = self.strengths.reshape((-1,) + extra_dims)
+        else:
+            raise ValueError(f"Invalid mode '{mode}'. Valid modes: 'nominal', 'per_particle', 'shape_only', 'absolute'.")
+
+        samples = means * factor
+        scaled_mc_stds = stds * factor
+
+        # Law of Total Variance (CORRECTED)
+        expected_val = np.mean(samples, axis=0)
+        
+        # Total Variance is the sample variance of the estimators
+        var_total = np.var(samples, axis=0, ddof=1) if N > 1 else np.zeros_like(expected_val)
+        
+        # MC Variance is the expected value of the MC error variance
+        var_mc = np.mean(scaled_mc_stds**2, axis=0)
+        
+        # Parameters Variance is Total minus MC
+        var_parameters = var_total - var_mc
+        # Clip negative variances that arise due to finite sample sizes
+        var_parameters = np.maximum(var_parameters, 0.0)
+
+        std_total = np.sqrt(var_total)
+        std_parameters = np.sqrt(var_parameters)
+        std_mc = np.sqrt(var_mc)
+
+        denom = np.maximum(np.abs(expected_val), 1e-30)
+        rel_total = (std_total / denom) * 100.0
+        rel_parameters = (std_parameters / denom) * 100.0
+        rel_mc = (std_mc / denom) * 100.0
+
+        var_denom = np.maximum(var_total, 1e-30)
+        parameters_share = (var_parameters / var_denom) * 100.0
+
+        return {
+            'mean': expected_val,
+            'std_dev_total': std_total,
+            'std_dev_parameters': std_parameters,
+            'std_dev_mc': std_mc,
+            'var_total': var_total,
+            'var_parameters': var_parameters,
+            'var_mc': var_mc,
+            'rel_total': rel_total,
+            'rel_parameters': rel_parameters,
+            'rel_mc': rel_mc,
+            'parameters_share': parameters_share,
+            'samples': samples,
+            'mode': mode,
+        }
+
+    def summary(self, mode: str = 'nominal') -> None:
+        """Prints a comprehensive, formatted ASCII summary of all UQ tallies."""
+        print("=" * 106)
+        mode_str = "Nominal Source Normalization" if mode == 'nominal' else mode.capitalize()
+        print(f"               OpenMC Tokamak Plasma UQ Summary ({self.n_realizations} Realizations, Mode: {mode_str})")
+        print("=" * 106)
+        header = f"{'Tally Name':<20} {'Score':<14} {'Mean':<14} {'Total Std(%)':<14} {'Params(%)':<14} {'MC(%)':<14} {'Plasma Share':<12}"
+        print(header)
+        print("-" * 106)
+
+        for name in sorted(self.realization_means.keys()):
+            stats = self.get_tally(name, mode=mode)
+            meta = self.tally_metadata.get(name, {})
+            score_str = ", ".join(meta.get('scores', ['tally'])) if isinstance(meta.get('scores'), list) else 'tally'
+
+            # Format scalar or multi-bin tally
+            mean_arr = np.atleast_1d(stats['mean'])
+            rel_tot_arr = np.atleast_1d(stats['rel_total'])
+            rel_param_arr = np.atleast_1d(stats['rel_parameters'])
+            rel_mc_arr = np.atleast_1d(stats['rel_mc'])
+            share_arr = np.atleast_1d(stats['parameters_share'])
+
+            for idx in range(len(mean_arr.flat)):
+                t_label = name if idx == 0 else f"  [bin {idx}]"
+                s_label = score_str if idx == 0 else ""
+                val = mean_arr.flat[idx]
+                r_tot = rel_tot_arr.flat[idx]
+                r_param = rel_param_arr.flat[idx]
+                r_mc = rel_mc_arr.flat[idx]
+                sh = share_arr.flat[idx]
+
+                print(f"{t_label:<20} {s_label:<14} {val:<14.4e} {r_tot:<14.2f}% {r_param:<14.2f}% {r_mc:<14.2f}% {sh:<11.1f}%")
+
+        print("=" * 106)
+        pct_strength = (self.std_strength / max(self.mean_strength, 1e-30)) * 100.0
+        print(f"Total Source Strength: {self.mean_strength:.4e} +/- {self.std_strength:.4e} neutrons/s ({pct_strength:.2f}% yield variance)")
+        print("=" * 106)
+
+    def to_dataframe(self, tally_name: str | None = None, mode: str = 'nominal'):
+        """Converts UQ realization data and statistics to a pandas DataFrame."""
+        import pandas as pd
+
+        target_tallies = [tally_name] if tally_name else sorted(self.realization_means.keys())
+        all_dfs = []
+
+        for name in target_tallies:
+            stats = self.get_tally(name, mode=mode)
+            means = stats['mean']
+            means_arr = np.atleast_1d(means)
+            
+            # Retrieve the structural DataFrame saved from the first realization
+            meta = self.tally_metadata.get(name, {})
+            df_struct = meta.get('df_structure', None)
+
+            for i in range(self.n_realizations):
+                sample_val = stats['samples'][i]
+                sample_arr = np.atleast_1d(sample_val)
+                
+                if df_struct is not None:
+                    # Create a copy of the structure for this realization
+                    df = df_struct.copy()
+                    df['tally'] = name
+                    df['realization'] = i
+                    df['source_strength_n_per_s'] = self.strengths[i]
+                    df['value'] = sample_arr.flatten()
+                    all_dfs.append(df)
+                else:
+                    # Fallback if structure is missing
+                    records = []
+                    for bin_idx, val in enumerate(sample_arr.flat):
+                        records.append({
+                            'tally': name,
+                            'bin': bin_idx,
+                            'realization': i,
+                            'source_strength_n_per_s': self.strengths[i],
+                            'value': float(val),
+                        })
+                    all_dfs.append(pd.DataFrame(records))
+
+        if all_dfs:
+            return pd.concat(all_dfs, ignore_index=True)
+        else:
+            return pd.DataFrame()

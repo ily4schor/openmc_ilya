@@ -36,8 +36,8 @@ def test_tokamak_source_roundtrip():
     assert isinstance(new, openmc.TokamakSource)
     assert new.major_radius == src.major_radius
     assert new.minor_radius == src.minor_radius
-    assert new.elongation == src.elongation
-    assert new.triangularity == src.triangularity
+    np.testing.assert_allclose(new.elongation, src.elongation)
+    np.testing.assert_allclose(new.triangularity, src.triangularity)
     assert new.shafranov_shift == src.shafranov_shift
     assert new.phi_start == src.phi_start
     assert new.phi_extent == src.phi_extent
@@ -165,6 +165,7 @@ def test_tokamak_source_poloidal_sampling(run_in_tmpdir):
             shafranov_shift=0.0,
             emission_density=np.ones(10),
             n_alpha=3,
+            method='bernstein',
             energy=openmc.stats.delta_function(14.07e6),
         )
 
@@ -261,3 +262,185 @@ def test_tokamak_source_sampling(run_in_tmpdir):
 
     assert_sample_mean(R, expected_R)
     assert_sample_mean((z - zshift)**2, expected_z2)
+
+
+def test_tokamak_source_profile_roundtrip():
+    """Verify XML serialization and deserialization for 1D profile geometries."""
+    r_over_a = np.linspace(0.0, 1.0, 15)
+    elongation = 1.8 - 0.2 * r_over_a**2
+    triangularity = 0.45 * r_over_a
+    src = make_source(
+        r_over_a=r_over_a,
+        emission_density=np.ones_like(r_over_a),
+        elongation=elongation,
+        triangularity=triangularity,
+    )
+    elem = src.to_xml_element()
+    assert elem.find('elongation_prime') is not None
+    assert elem.find('triangularity_prime') is not None
+
+    new = openmc.SourceBase.from_xml_element(elem)
+    assert isinstance(new, openmc.TokamakSource)
+    np.testing.assert_allclose(new.elongation, src.elongation)
+    np.testing.assert_allclose(new.triangularity, src.triangularity)
+    np.testing.assert_allclose(new.r_over_a, src.r_over_a)
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(elongation=np.ones(5)), "elongation profile"),
+    (dict(triangularity=np.ones(5)), "triangularity profile"),
+    (dict(elongation=[-1.0] * 10), "elongation values must be > 0"),
+    (dict(triangularity=[1.5] * 10), "triangularity values must be in"),
+    (dict(elongation=np.ones(10), method='bernstein'), "Bernstein method requires scalar"),
+])
+def test_tokamak_source_profile_invalid(kwargs, match):
+    """Verify input validation rules for 1D profile geometries."""
+    with pytest.raises(ValueError, match=match):
+        make_source(**kwargs)
+
+
+def test_tokamak_source_profile_sampling(run_in_tmpdir):
+    """Exercise Fourier-Bessel sampling with 1D profile geometries and verify spatial bounds."""
+    R0, a = 620.0, 200.0
+    shafranov, zshift = 20.0, 15.0
+    r_over_a = np.linspace(0.0, 1.0, 50)
+    kappa = 1.8 - 0.3 * r_over_a**2
+    delta = 0.4 * r_over_a
+
+    src = make_source(
+        major_radius=R0,
+        minor_radius=a,
+        elongation=kappa,
+        triangularity=delta,
+        shafranov_shift=shafranov,
+        vertical_shift=zshift,
+        r_over_a=r_over_a,
+        emission_density=1.0 - r_over_a**2,
+        energy=openmc.stats.delta_function(14.08e6),
+    )
+
+    sphere = openmc.Sphere(r=2000.0, boundary_type='vacuum')
+    cell = openmc.Cell(region=-sphere)
+    model = openmc.Model(
+        geometry=openmc.Geometry([cell]),
+        settings=openmc.Settings(particles=100, batches=1, run_mode='fixed source', source=src),
+    )
+
+    sites = model.sample_external_source(2000)
+    xyz = np.array([s.r for s in sites])
+    R = np.hypot(xyz[:, 0], xyz[:, 1])
+    z = xyz[:, 2]
+
+    # Verify positions are bounded by the plasma boundary
+    assert R.min() >= R0 - a
+    assert R.max() <= R0 + a + shafranov
+    assert np.abs(z - zshift).max() <= np.max(kappa) * a
+
+
+def test_tokamak_source_ensemble_kl_and_slicing():
+    """Verify TokamakSourceEnsemble creation, KL expansion, slicing, and reaction channels."""
+    n_samples = 4
+    n_points = 10
+    r_over_a = np.linspace(0.0, 1.0, n_points)
+    temperature = np.full((n_samples, n_points), 2.0e4)
+    density_D = np.full((n_samples, n_points), 5.0e19)
+    density_T = np.full((n_samples, n_points), 5.0e19)
+
+    ensemble = openmc.TokamakSourceEnsemble(
+        major_radius=620.0,
+        minor_radius=200.0,
+        elongation=1.8,
+        triangularity=0.45,
+        shafranov_shift=10.0,
+        r_over_a=r_over_a,
+        temperature=temperature,
+        density_D=density_D,
+        density_T=density_T,
+    )
+
+    assert len(ensemble) == n_samples
+    assert len(ensemble.strengths) == n_samples
+    assert np.all(ensemble.strengths > 0)
+    assert ensemble.mean_strength > 0
+
+    # Test indexing and realization sampling
+    sources = ensemble[0]
+    assert len(sources) == 3
+    assert all(isinstance(s, openmc.TokamakSource) for s in sources)
+
+    # Test slicing
+    sub_ens = ensemble[0:2]
+    assert isinstance(sub_ens, openmc.TokamakSourceEnsemble)
+    assert len(sub_ens) == 2
+
+    # Test reaction sampling
+    src_dt = ensemble.sample_reaction(0, reaction='DT')
+    assert isinstance(src_dt, openmc.TokamakSource)
+    assert src_dt.strength > 0
+
+    src_tot = ensemble.sample_reaction(0, reaction='total')
+    assert isinstance(src_tot, openmc.TokamakSource)
+
+    # Test KL expansion helper method directly
+    cov = np.eye(5) * 0.1
+    kl_res = openmc.TokamakSourceEnsemble._perform_kl_expansion(cov, kl_components=0.99)
+    assert kl_res['n_modes'] > 0
+    assert 'mode_basis' in kl_res
+    assert kl_res['mode_basis'].shape[0] == 5
+
+
+def test_tokamak_source_model_run_uq(run_in_tmpdir):
+    """Verify Model.run_uq execution, tally extraction, and Law of Total Variance."""
+    sphere = openmc.Sphere(r=2000.0, boundary_type='vacuum')
+    cell = openmc.Cell(region=-sphere)
+    tally = openmc.Tally(name='flux_tally')
+    tally.scores = ['flux']
+
+    model = openmc.Model(
+        geometry=openmc.Geometry([cell]),
+        settings=openmc.Settings(particles=10, batches=2, run_mode='fixed source'),
+        tallies=openmc.Tallies([tally]),
+    )
+
+    r_over_a = np.linspace(0.0, 1.0, 10)
+    ensemble = openmc.TokamakSourceEnsemble(
+        major_radius=620.0,
+        minor_radius=200.0,
+        elongation=1.8,
+        triangularity=0.45,
+        shafranov_shift=10.0,
+        r_over_a=r_over_a,
+        temperature=np.full((2, 10), 2.0e4),
+        density_D=np.full((2, 10), 5.0e19),
+        density_T=np.full((2, 10), 5.0e19),
+    )
+
+    uq_res = model.run_uq(
+        ensemble=ensemble,
+        n_realizations=2,
+        cwd="uq_runs",
+        keep_statepoints=False,
+    )
+
+    assert isinstance(uq_res, openmc.model.UQResult)
+    assert uq_res.n_realizations == 2
+    assert 'flux_tally' in uq_res.realization_means
+
+    # Test Law of Total Variance breakdown
+    stats_nom = uq_res.get_tally('flux_tally', mode='nominal')
+    assert stats_nom['mean'] > 0.0
+    assert stats_nom['std_dev_total'] >= 0.0
+    assert stats_nom['std_dev_mc'] >= 0.0
+    assert stats_nom['std_dev_parameters'] >= 0.0
+
+    # Test per-particle and absolute modes
+    stats_pp = uq_res.get_tally('flux_tally', mode='per_particle')
+    stats_abs = uq_res.get_tally('flux_tally', mode='absolute')
+    assert stats_pp['mean'] > 0.0
+    assert stats_abs['mean'] > 0.0
+
+    # Test DataFrame export
+    df = uq_res.to_dataframe()
+    assert len(df) == 2
+    assert 'flux_tally' in df['tally'].values
+

@@ -1039,6 +1039,14 @@ class TokamakSource(SourceBase):
             from scipy.interpolate import CubicSpline
             self.elongation = np.asarray(elongation) if isinstance(elongation, Iterable) else np.full_like(self.r_over_a, float(elongation))
             self.triangularity = np.asarray(triangularity) if isinstance(triangularity, Iterable) else np.full_like(self.r_over_a, float(triangularity))
+            if len(self.elongation) != len(self.r_over_a):
+                raise ValueError(
+                    f"elongation profile (length {len(self.elongation)}) must "
+                    f"have the same length as r_over_a (length {len(self.r_over_a)})")
+            if len(self.triangularity) != len(self.r_over_a):
+                raise ValueError(
+                    f"triangularity profile (length {len(self.triangularity)}) must "
+                    f"have the same length as r_over_a (length {len(self.r_over_a)})")
             bc = ((1, 0.0), 'not-a-knot')
             self._kappa_prime = CubicSpline(self.r_over_a, self.elongation, bc_type=bc).derivative()(self.r_over_a)
             self._delta_prime = CubicSpline(self.r_over_a, self.triangularity, bc_type=bc).derivative()(self.r_over_a)
@@ -1603,6 +1611,7 @@ class TokamakSource(SourceBase):
         n_alpha: int = 101,
         vertical_shift: float = 0.0,
         strength: float = 1.0,
+        scale_to_cm: float | None = None,
         constraints: dict[str, Any] | None = None
     ) -> TokamakSource:
         """Create a deterministic TokamakSource directly from an IMAS equilibrium and core profiles.
@@ -1639,7 +1648,7 @@ class TokamakSource(SourceBase):
             energy distributions.
         """
         ods = cls._load_ods(imas_input)
-        data = cls._extract_and_map_imas_profiles(ods, n_points=n_points)
+        data = cls._extract_and_map_imas_profiles(ods, n_points=n_points, scale_to_cm=scale_to_cm)
 
         return cls.from_profiles(
             r_over_a=data['r_over_a'],
@@ -1689,7 +1698,7 @@ class TokamakSource(SourceBase):
             raise ValueError("Unsupported file extension. Expected '.nc', '.h5', or '.hdf5'.")
 
     @staticmethod
-    def _extract_and_map_imas_profiles(ods: Any, n_points: int = 101) -> Dict[str, Any]:
+    def _extract_and_map_imas_profiles(ods: Any, n_points: int = 101, scale_to_cm: float | None = None) -> Dict[str, Any]:
         """Extracts 1D profiles and geometry from IMAS and maps to a uniform r_over_a grid."""
         from scipy.interpolate import PchipInterpolator
 
@@ -1713,7 +1722,8 @@ class TokamakSource(SourceBase):
         # Convert to cm for OpenMC (IMAS stores meters)
         # Note: If IMAS is in meters, multiply by 100 to get cm for OpenMC
         # If already in cm (R0 > 20), keep as-is
-        scale_to_cm = 100.0 if R0 < 20.0 else 1.0
+        if scale_to_cm is None:
+            scale_to_cm = 100.0 if R0 < 20.0 else 1.0
         major_radius_cm = R0 * scale_to_cm
         minor_radius_cm = a_minor * scale_to_cm
 
@@ -2313,10 +2323,12 @@ class TokamakSourceEnsemble:
         """
         from scipy.special import jv
 
-        # Convert dimensions to meters for volume element
-        R0_m = major_radius / 100.0 if major_radius > 20.0 else major_radius
-        a_m = minor_radius / 100.0 if minor_radius > 20.0 else minor_radius
-        shift_m = shafranov_shift / 100.0 if shafranov_shift > 20.0 else shafranov_shift
+        # Convert dimensions to meters for volume element.
+        # If major_radius > 20, geometry is defined in cm (OpenMC standard), convert to meters.
+        scale = 0.01 if major_radius > 20.0 else 1.0
+        R0_m = major_radius * scale
+        a_m = minor_radius * scale
+        shift_m = shafranov_shift * scale
 
         r_tilde = np.asarray(r_over_a, dtype=float)
         eps = a_m / R0_m if R0_m > 0 else 0.0
@@ -2409,6 +2421,7 @@ class TokamakSourceEnsemble:
         n_alpha: int = 101,
         vertical_shift: float = 0.0,
         random_seed: int | np.random.Generator | None = None,
+        scale_to_cm: float | None = None,
         constraints: dict[str, Any] | None = None
     ) -> TokamakSourceEnsemble:
         """Create a TokamakSourceEnsemble directly from an IMAS equilibrium and core profiles with covariance matrices.
@@ -2469,7 +2482,11 @@ class TokamakSourceEnsemble:
             rho_raw = np.asarray(cp['grid']['rho_tor_norm'], dtype=float)
             r_tilde_mapped = rho_raw.copy()
 
-        scale_to_cm = 100.0 if R0 < 20.0 else 1.0
+        # Convert to cm for OpenMC (IMAS stores meters)
+        # Note: If IMAS is in meters, multiply by 100 to get cm for OpenMC
+        # If already in cm (R0 > 20), keep as-is
+        if scale_to_cm is None:
+            scale_to_cm = 100.0 if R0 < 20.0 else 1.0
         major_radius_cm = R0 * scale_to_cm
         minor_radius_cm = a_minor * scale_to_cm
 

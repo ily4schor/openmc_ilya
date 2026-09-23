@@ -1308,6 +1308,7 @@ void TokamakSource::precompute_fourier_distributions()
     cdf_half.back() = 1.0;
     for (int j = 1; j < n_alpha; ++j) {
       if (cdf_half[j] < cdf_half[j - 1]) cdf_half[j] = cdf_half[j - 1];
+      if (cdf_half[j] > 1.0) cdf_half[j] = 1.0;
     }
 
     // Evaluate corresponding PDF values on alpha in [0, pi]
@@ -1438,6 +1439,7 @@ double TokamakSource::sample_poloidal_angle_bernstein(
 double TokamakSource::sample_poloidal_angle_fourier(
   double r_norm, uint64_t* seed) const
 {
+  r_norm = std::clamp(r_norm, 0.0, 1.0);
   // Multiple distributions: stochastic selection between bracketing r points
   size_t i = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm);
   size_t idx;
@@ -1520,7 +1522,7 @@ SourceSite TokamakSource::sample(uint64_t* seed) const
   site.delayed_group = 0;
 
   // 1. Sample r/a from radial CDF
-  double r_norm = sample_r_over_a(seed);
+  double r_norm = std::clamp(sample_r_over_a(seed), 0.0, 1.0);
   double r = r_norm * minor_radius_;
 
   // 2. Sample poloidal angle from conditional distribution P(alpha|r)
