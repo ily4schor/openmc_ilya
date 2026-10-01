@@ -1682,7 +1682,7 @@ class TokamakSource(SourceBase):
                 "Install it via: pip install omas"
             )
 
-        if isinstance(imas_input, ODS):
+        if isinstance(imas_input, (ODS, dict)):
             return imas_input
 
         path = Path(imas_input)
@@ -2503,18 +2503,34 @@ class TokamakSourceEnsemble:
         density_T_mean = np.maximum(0.0, PchipInterpolator(r_tilde_mapped, nT_mean_raw)(r_over_a))
 
         # 3. Extract Covariance Submatrices and Map via Eigenvector Mode Splines
-        if 'covariance' in ods['core_profiles'] and 'data' in ods['core_profiles']['covariance']:
-            full_cov = np.asarray(ods['core_profiles']['covariance']['data'], dtype=float)
-            rows_uri = [str(u) for u in ods['core_profiles']['covariance']['rows_uri']]
+        if 'covariance' not in ods['core_profiles'] or 'data' not in ods['core_profiles']['covariance']:
+            raise ValueError(
+                "No covariance data found in IMAS core_profiles ('core_profiles.covariance.data'). "
+                "TokamakSourceEnsemble.from_imas requires a covariance matrix to perform "
+                "Karhunen-Loève profile sampling."
+            )
 
-            ne_idx = [i for i, u in enumerate(rows_uri) if 'electrons.density' in u]
-            ti_idx = [i for i, u in enumerate(rows_uri) if 't_i_average' in u]
+        full_cov = np.asarray(ods['core_profiles']['covariance']['data'], dtype=float)
+        if 'rows_uri' not in ods['core_profiles']['covariance']:
+            raise ValueError(
+                "No 'rows_uri' metadata found in IMAS core_profiles covariance."
+            )
+        rows_uri = [str(u) for u in ods['core_profiles']['covariance']['rows_uri']]
 
-            cov_ne_raw = full_cov[np.ix_(ne_idx, ne_idx)] if len(ne_idx) > 0 else np.diag(0.01 * ne_mean_raw**2)
-            cov_Ti_raw = full_cov[np.ix_(ti_idx, ti_idx)] if len(ti_idx) > 0 else np.diag(0.01 * T_mean_raw**2)
-        else:
-            cov_ne_raw = np.diag(0.01 * ne_mean_raw**2)
-            cov_Ti_raw = np.diag(0.01 * T_mean_raw**2)
+        ne_idx = [i for i, u in enumerate(rows_uri) if 'electrons.density' in u]
+        ti_idx = [i for i, u in enumerate(rows_uri) if 't_i_average' in u]
+
+        if len(ne_idx) == 0:
+            raise ValueError(
+                "No electron density covariance found in IMAS covariance matrix ('electrons.density')."
+            )
+        if len(ti_idx) == 0:
+            raise ValueError(
+                "No ion temperature covariance found in IMAS covariance matrix ('t_i_average')."
+            )
+
+        cov_ne_raw = full_cov[np.ix_(ne_idx, ne_idx)]
+        cov_Ti_raw = full_cov[np.ix_(ti_idx, ti_idx)]
 
         # Scale electron density covariance for D and T species
         fD_raw = nD_mean_raw / np.maximum(ne_mean_raw, 1e-30)

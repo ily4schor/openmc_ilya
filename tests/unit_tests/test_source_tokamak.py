@@ -444,3 +444,28 @@ def test_tokamak_source_model_run_uq(run_in_tmpdir):
     assert len(df) == 2
     assert 'flux_tally' in df['tally'].values
 
+
+def test_tokamak_source_ensemble_from_imas_missing_covariance():
+    """Verify that TokamakSourceEnsemble.from_imas raises ValueError when covariance is absent."""
+    fake_ods = {
+        'core_profiles': {
+            'profiles_1d': [{
+                'grid': {'rho_tor_norm': np.linspace(0, 1, 10)},
+                't_i_average': np.full(10, 1.0e4),
+                'ion': [{'density': np.full(10, 1.0e19)}, {'density': np.full(10, 1.0e19)}],
+                'electrons': {'density': np.full(10, 2.0e19)}
+            }]
+        },
+        'equilibrium': {
+            'time_slice': [{
+                'profiles_1d': {
+                    'r_inboard': np.linspace(2.0, 1.0, 10),
+                    'r_outboard': np.linspace(4.0, 5.0, 10)
+                }
+            }]
+        }
+    }
+    with pytest.raises(ValueError, match="No covariance data found in IMAS core_profiles"):
+        openmc.TokamakSourceEnsemble.from_imas(fake_ods)
+
+
