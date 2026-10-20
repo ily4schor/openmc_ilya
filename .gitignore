@@ -110,3 +110,6 @@ CMakeSettings.json
 
 # Python pickle files
 *.pkl
+
+# Third-party vendor dependencies fetched by CMake FetchContent
+vendor/

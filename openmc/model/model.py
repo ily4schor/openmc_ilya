@@ -1048,7 +1048,7 @@ class Model:
             Base working directory for UQ runs (default: 'uq_runs').
         keep_statepoints : bool, optional
             Whether to keep individual statepoint files on disk (default: True).
-            Set to False to save disk space.
+            Set to False to save disk space by deleting .h5 files after tallies are extracted.
         output : bool, optional
             Whether to display OpenMC standard output during each realization run (default: False).
         openmc_exec : str, optional
@@ -1117,8 +1117,9 @@ class Model:
                 # Assign the rigorously generated independent seed
                 self.settings.seed = int(realization_seeds[k])
 
-                # Assign the 3 sources (DT, DD, TT) for this realization
-                self.settings.source = ensemble.sample(k)
+                # Assign the 3 sources (DT, DD, TT) normalized to 1.0 relative strength
+                # for realization k
+                self.settings.source = ensemble.sample(k, normalize_strength=True)
                 strengths_evaluated.append(float(ensemble.strengths[k]))
 
                 print(f"  -> [{k + 1}/{N}] Simulating realization {k} (strength: {ensemble.strengths[k]:.3e} n/s)...")

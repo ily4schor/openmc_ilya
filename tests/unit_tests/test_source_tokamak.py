@@ -469,3 +469,451 @@ def test_tokamak_source_ensemble_from_imas_missing_covariance():
         openmc.TokamakSourceEnsemble.from_imas(fake_ods)
 
 
+def test_find_fuel_ion_densities_by_name():
+    """Verify fuel ion extraction correctly identifies species by name, order, and ignores impurities."""
+    grid = np.linspace(0, 1, 10)
+    dens_D = np.full(10, 5.0e19)
+    dens_T = np.full(10, 4.0e19)
+    dens_W = np.full(10, 1.0e16)
+    dens_B = np.full(10, 2.0e17)
+
+    # 1. Multi-species plasma in normal order [D, T, W, B]
+    cp_normal = {
+        'ion': [
+            {'name': 'D', 'density': dens_D},
+            {'name': 'T', 'density': dens_T},
+            {'name': 'W', 'density': dens_W},
+            {'name': 'B', 'density': dens_B},
+        ]
+    }
+    nD, nT = openmc.TokamakSource._find_fuel_ion_densities(cp_normal)
+    np.testing.assert_allclose(nD, dens_D)
+    np.testing.assert_allclose(nT, dens_T)
+
+    # 2. Reversed order [T, D]
+    cp_reversed = {
+        'ion': [
+            {'name': 'T', 'density': dens_T},
+            {'name': 'D', 'density': dens_D},
+        ]
+    }
+    nD_rev, nT_rev = openmc.TokamakSource._find_fuel_ion_densities(cp_reversed)
+    np.testing.assert_allclose(nD_rev, dens_D)
+    np.testing.assert_allclose(nT_rev, dens_T)
+
+
+def test_find_fuel_ion_densities_by_composition():
+    """Verify fuel ion extraction correctly identifies species by atomic number Z and mass A."""
+    dens_D = np.full(10, 5.0e19)
+    dens_T = np.full(10, 4.0e19)
+
+    cp_comp = {
+        'ion': [
+            {'element': [{'z_n': 1, 'a': 3}], 'density': dens_T},
+            {'element': [{'z_n': 1, 'a': 2}], 'density': dens_D},
+        ]
+    }
+    nD, nT = openmc.TokamakSource._find_fuel_ion_densities(cp_comp)
+    np.testing.assert_allclose(nD, dens_D)
+    np.testing.assert_allclose(nT, dens_T)
+
+
+def test_find_fuel_ion_densities_reaction_specific():
+    """Verify single-species identification for pure DD or TT fusion reactions."""
+    dens_D = np.full(10, 5.0e19)
+    cp_pure_D = {
+        'ion': [{'name': 'D', 'density': dens_D}]
+    }
+    nD, nT = openmc.TokamakSource._find_fuel_ion_densities(cp_pure_D, reaction='DD')
+    np.testing.assert_allclose(nD, dens_D)
+    assert np.all(nT == 0.0)
+
+    dens_T = np.full(10, 4.0e19)
+    cp_pure_T = {
+        'ion': [{'name': 'T', 'density': dens_T}]
+    }
+    nD_t, nT_t = openmc.TokamakSource._find_fuel_ion_densities(cp_pure_T, reaction='TT')
+    assert np.all(nD_t == 0.0)
+    np.testing.assert_allclose(nT_t, dens_T)
+
+
+def test_find_fuel_ion_densities_fallbacks_and_errors():
+    """Verify fallback behavior for legacy unlabelled fixtures and missing species errors."""
+    dens1 = np.full(10, 1.0e19)
+    dens2 = np.full(10, 2.0e19)
+
+    # Legacy unlabelled fixture
+    cp_unlabelled = {'ion': [{'density': dens1}, {'density': dens2}]}
+    nD, nT = openmc.TokamakSource._find_fuel_ion_densities(cp_unlabelled)
+    np.testing.assert_allclose(nD, dens1)
+    np.testing.assert_allclose(nT, dens2)
+
+    # Electron-density only fixture
+    ne = np.full(10, 4.0e19)
+    cp_electrons = {'electrons': {'density': ne}}
+    nD_e, nT_e = openmc.TokamakSource._find_fuel_ion_densities(cp_electrons)
+    np.testing.assert_allclose(nD_e, 0.5 * ne)
+    np.testing.assert_allclose(nT_e, 0.5 * ne)
+
+    # Unresolvable species
+    cp_unresolvable = {'ion': [{'name': 'He4', 'density': dens1}]}
+    with pytest.raises(ValueError, match="Unable to resolve Deuterium and Tritium"):
+        openmc.TokamakSource._find_fuel_ion_densities(cp_unresolvable)
+
+
+@pytest.mark.filterwarnings("ignore:Setting the shape on a NumPy array:DeprecationWarning")
+def test_native_imas_netcdf_reader(tmp_path):
+    """Verify native IMAS NetCDF-4 group hierarchy reader with time-slicing and AoS mapping."""
+    netCDF4 = pytest.importorskip("netCDF4")
+
+    nc_file = tmp_path / "imas_test.nc"
+    with netCDF4.Dataset(str(nc_file), "w", format="NETCDF4") as ds:
+        # Create core_profiles IDS group
+        cp_grp = ds.createGroup("core_profiles").createGroup("0")
+        cp_grp.createDimension("time", 2)
+        cp_grp.createDimension("rho_dim", 10)
+        cp_grp.createDimension("ion_dim", 2)
+
+        v_rho = cp_grp.createVariable("profiles_1d.grid.rho_tor_norm", "f8", ("time", "rho_dim"))
+        v_rho[:] = np.tile(np.linspace(0, 1, 10), (2, 1))
+
+        v_ne = cp_grp.createVariable("profiles_1d.electrons.density", "f8", ("time", "rho_dim"))
+        v_ne[:] = np.tile(np.full(10, 5.0e19), (2, 1))
+
+        v_ti = cp_grp.createVariable("profiles_1d.t_i_average", "f8", ("time", "rho_dim"))
+        v_ti[:] = np.tile(np.full(10, 1.5e4), (2, 1))
+
+        v_ion_name = cp_grp.createVariable("profiles_1d.ion.name", str, ("time", "ion_dim"))
+        v_ion_name[:] = np.array([["D", "T"], ["D", "T"]], dtype=object)
+
+        v_ion_dens = cp_grp.createVariable("profiles_1d.ion.density", "f8", ("time", "ion_dim", "rho_dim"))
+        v_ion_dens[0, 0, :] = np.full(10, 2.5e19)
+        v_ion_dens[0, 1, :] = np.full(10, 2.5e19)
+        v_ion_dens[1, 0, :] = np.full(10, 2.5e19)
+        v_ion_dens[1, 1, :] = np.full(10, 2.5e19)
+
+        # Create equilibrium IDS group
+        eq_grp = ds.createGroup("equilibrium").createGroup("0")
+        eq_grp.createDimension("time", 2)
+        eq_grp.createDimension("grid_dim", 10)
+
+        v_rout = eq_grp.createVariable("time_slice.profiles_1d.r_outboard", "f8", ("time", "grid_dim"))
+        v_rout[:] = np.tile(np.linspace(3.1, 5.0, 10), (2, 1))
+
+        v_rin = eq_grp.createVariable("time_slice.profiles_1d.r_inboard", "f8", ("time", "grid_dim"))
+        v_rin[:] = np.tile(np.linspace(3.1, 1.0, 10), (2, 1))
+
+        v_elong = eq_grp.createVariable("time_slice.profiles_1d.elongation", "f8", ("time", "grid_dim"))
+        v_elong[:] = np.tile(np.full(10, 1.7), (2, 1))
+
+        v_mag = eq_grp.createVariable("time_slice.global_quantities.magnetic_axis.r", "f8", ("time",))
+        v_mag[:] = [3.1, 3.1]
+
+    # Test reading via TokamakSource.from_imas
+    src = openmc.TokamakSource.from_imas(nc_file)
+    assert isinstance(src, openmc.TokamakSource)
+    assert np.isclose(src.major_radius, 300.0)  # R0 = (5.0 + 1.0)/2 = 3.0 m = 300 cm
+    assert np.isclose(src.minor_radius, 200.0)  # a = (5.0 - 1.0)/2 = 2.0 m = 200 cm
+    assert np.isclose(src.shafranov_shift, 10.0)  # R_mag - R0 = 3.1 - 3.0 = 0.1 m = 10 cm
+
+
+def test_load_ods_error_handling(tmp_path):
+    """Verify error handling in _load_ods for invalid paths and extensions."""
+    with pytest.raises(FileNotFoundError, match="Path not found"):
+        openmc.TokamakSource._load_ods(tmp_path / "non_existent_file.nc")
+
+    invalid_ext = tmp_path / "invalid_file.txt"
+    invalid_ext.write_text("dummy")
+    with pytest.raises(ValueError, match="Unsupported file extension"):
+        openmc.TokamakSource._load_ods(invalid_ext)
+
+
+def test_find_fuel_ion_densities_named_non_fuel_rejection():
+    """Verify that explicitly named non-fuel impurities (e.g. He, Ne) are rejected."""
+    dens_he = np.full(10, 1.0e19)
+    dens_ne = np.full(10, 2.0e18)
+
+    cp = {
+        'ion': [
+            {'name': 'He', 'density': dens_he},
+            {'name': 'Ne', 'density': dens_ne},
+        ]
+    }
+    with pytest.raises(ValueError, match="could not identify required fuel species"):
+        openmc.TokamakSource._find_fuel_ion_densities(cp, reaction='DT')
+
+
+def test_find_fuel_ion_densities_single_fuel_species():
+    """Verify that if D is present but T is missing in DT reaction, it warns and sets nT=0 (not overwritten with ne)."""
+    dens_d = np.full(10, 4.0e19)
+    dens_he = np.full(10, 1.0e19)
+    ne = np.full(10, 6.0e19)
+
+    cp = {
+        'ion': [
+            {'name': 'D', 'density': dens_d},
+            {'name': 'He', 'density': dens_he},
+        ],
+        'electrons': {'density': ne}
+    }
+    with pytest.warns(UserWarning, match="Assuming Tritium density is zero"):
+        nD, nT = openmc.TokamakSource._find_fuel_ion_densities(cp, reaction='DT')
+    np.testing.assert_allclose(nD, dens_d)
+    assert np.all(nT == 0.0)
+
+
+def test_grid_mismatch_equilibrium_core_profiles():
+    """Verify that equilibrium and core_profiles with different grid sizes are correctly aligned and values match."""
+    # 21 equilibrium grid points with linear mapping r_tilde = rho
+    n_eq = 21
+    r_in = np.linspace(3.0, 1.0, n_eq)
+    r_out = np.linspace(3.0, 5.0, n_eq)
+    rho_eq = np.linspace(0.0, 1.0, n_eq)
+    elong = np.full(n_eq, 1.6)
+
+    # 11 core_profiles grid points: parabolic temperature T(rho) = 10000 * (1 - rho^2)
+    n_cp = 11
+    rho_cp = np.linspace(0.0, 1.0, n_cp)
+    ti = 10000.0 * (1.0 - rho_cp**2)
+    nd = np.full(n_cp, 4.0e19)
+    nt = np.full(n_cp, 4.0e19)
+
+    ods = {
+        'core_profiles': {
+            'profiles_1d': [{
+                'grid': {'rho_tor_norm': rho_cp},
+                't_i_average': ti,
+                'ion': [
+                    {'name': 'D', 'density': nd},
+                    {'name': 'T', 'density': nt},
+                ]
+            }]
+        },
+        'equilibrium': {
+            'time_slice': [{
+                'profiles_1d': {
+                    'r_inboard': r_in,
+                    'r_outboard': r_out,
+                    'rho_tor_norm': rho_eq,
+                    'elongation': elong,
+                    'triangularity': np.zeros(n_eq),
+                },
+                'global_quantities': {
+                    'magnetic_axis': {'r': 3.0}
+                }
+            }]
+        }
+    }
+
+    data = openmc.TokamakSource._extract_and_map_imas_profiles(ods, n_points=51)
+    assert len(data['temperature']) == 51
+    assert len(data['density_D']) == 51
+    assert len(data['elongation']) == 51
+    assert len(data['r_tilde_mapped']) == n_cp
+    assert np.isclose(data['major_radius'], 300.0)
+    assert np.isclose(data['minor_radius'], 200.0)
+    # Check value accuracy at r/a = 0.5 (index 25 on 51-point grid): T should be ~7500 eV
+    assert np.isclose(data['temperature'][25], 7500.0, rtol=1e-2)
+
+
+def test_grid_mismatch_rho_cp_terminates_early():
+    """Verify that core profiles terminating before rho=1.0 do not get erroneously stretched."""
+    n_eq = 21
+    r_in = np.linspace(3.0, 1.0, n_eq)
+    r_out = np.linspace(3.0, 5.0, n_eq)
+    rho_eq = np.linspace(0.0, 1.0, n_eq)
+
+    # Core profiles only extend to rho=0.9
+    n_cp = 10
+    rho_cp = np.linspace(0.0, 0.9, n_cp)
+    ti = np.full(n_cp, 10.0e3)
+    nd = np.full(n_cp, 4.0e19)
+    nt = np.full(n_cp, 4.0e19)
+
+    ods = {
+        'core_profiles': {
+            'profiles_1d': [{
+                'grid': {'rho_tor_norm': rho_cp},
+                't_i_average': ti,
+                'ion': [
+                    {'name': 'D', 'density': nd},
+                    {'name': 'T', 'density': nt},
+                ]
+            }]
+        },
+        'equilibrium': {
+            'time_slice': [{
+                'profiles_1d': {
+                    'r_inboard': r_in,
+                    'r_outboard': r_out,
+                    'rho_tor_norm': rho_eq,
+                },
+                'global_quantities': {'magnetic_axis': {'r': 3.0}}
+            }]
+        }
+    }
+
+    with pytest.warns(UserWarning, match="Core profiles grid terminates at rho=0.900"):
+        data = openmc.TokamakSource._extract_and_map_imas_profiles(ods, n_points=51)
+    # r_tilde_mapped[-1] should accurately reflect rho=0.9, NOT be clamped to 1.0
+    assert np.isclose(data['r_tilde_mapped'][-1], 0.9, atol=1e-2)
+
+
+def test_elongation_without_r_inboard():
+    """Verify that elongation with missing r_inboard/r_outboard falls back gracefully without length mismatch."""
+    n_eq = 15
+    elong = np.full(n_eq, 1.6)
+    n_cp = 10
+    ods = {
+        'core_profiles': {
+            'profiles_1d': [{
+                'grid': {'rho_tor_norm': np.linspace(0, 1, n_cp)},
+                't_i_average': np.full(n_cp, 10.0e3),
+                'ion': [
+                    {'name': 'D', 'density': np.full(n_cp, 4.0e19)},
+                    {'name': 'T', 'density': np.full(n_cp, 4.0e19)},
+                ]
+            }]
+        },
+        'equilibrium': {
+            'time_slice': [{
+                'profiles_1d': {'elongation': elong},
+            }]
+        }
+    }
+
+    with pytest.warns(UserWarning, match="No 'r_inboard' and 'r_outboard' found in equilibrium"):
+        data = openmc.TokamakSource._extract_and_map_imas_profiles(ods, n_points=51)
+    assert len(data['elongation']) == 51
+    assert np.allclose(data['elongation'], 1.6)
+
+
+def test_invalid_minor_radius_raises():
+    """Verify that degenerate boundary radii (a <= 0) raise a ValueError."""
+    ods = {
+        'core_profiles': {
+            'profiles_1d': [{
+                't_i_average': np.full(10, 10.0e3),
+                'ion': [{'name': 'D', 'density': np.full(10, 4.0e19)}, {'name': 'T', 'density': np.full(10, 4.0e19)}]
+            }]
+        },
+        'equilibrium': {
+            'time_slice': [{
+                'profiles_1d': {
+                    'r_inboard': np.array([3.0, 3.0]),
+                    'r_outboard': np.array([3.0, 3.0]),  # r_out - r_in = 0 => a = 0
+                }
+            }]
+        }
+    }
+    with pytest.raises(ValueError, match="Invalid minor radius"):
+        openmc.TokamakSource._extract_and_map_imas_profiles(ods)
+
+
+def test_empty_optional_fields_handling():
+    """Verify that empty optional arrays in IMAS structures do not trigger interpolation errors."""
+    n_grid = 15
+    r_in = np.linspace(3.1, 1.0, n_grid)
+    r_out = np.linspace(3.1, 5.0, n_grid)
+    ti = np.full(n_grid, 10.0e3)
+    nd = np.full(n_grid, 4.0e19)
+    nt = np.full(n_grid, 4.0e19)
+
+    ods = {
+        'core_profiles': {
+            'profiles_1d': [{
+                'grid': {'rho_tor_norm': np.linspace(0.0, 1.0, n_grid)},
+                't_i_average': ti,
+                'electrons': {'density': np.array([])},  # empty array
+                'ion': [
+                    {'name': 'D', 'density': nd},
+                    {'name': 'T', 'density': nt},
+                ]
+            }]
+        },
+        'equilibrium': {
+            'time_slice': [{
+                'profiles_1d': {
+                    'r_inboard': r_in,
+                    'r_outboard': r_out,
+                    'elongation': np.array([]),  # empty array
+                    'triangularity_upper': np.array([]),  # empty array
+                    'triangularity_lower': np.array([]),  # empty array
+                },
+                'global_quantities': {
+                    'magnetic_axis': {'r': np.array([])}  # empty array
+                }
+            }]
+        }
+    }
+
+    data = openmc.TokamakSource._extract_and_map_imas_profiles(ods, n_points=31)
+    assert len(data['temperature']) == 31
+    assert np.all(data['elongation'] == 1.0)
+    assert np.all(data['triangularity'] == 0.0)
+    assert data['shafranov_shift'] == 0.0
+
+
+def test_tokamak_source_ensemble_kl_info_attribute():
+    """Verify kl_info attribute is initialized to None and preserved across slicing."""
+    ens = openmc.TokamakSourceEnsemble(
+        major_radius=300.0,
+        minor_radius=100.0,
+        elongation=1.5,
+        triangularity=0.3,
+        r_over_a=np.linspace(0.0, 1.0, 10),
+        temperature=np.full((3, 10), 10.0e3),
+        density_D=np.full((3, 10), 4.0e19),
+        density_T=np.full((3, 10), 4.0e19),
+    )
+    assert ens.kl_info is None
+    sub = ens[0:2]
+    assert sub.kl_info is None
+
+
+def test_tokamak_source_ensemble_single_species_sampling():
+    """Verify ensemble sampling and reaction dispatch for single-species (D-only) plasmas."""
+    n_samples = 2
+    n_points = 10
+    r_over_a = np.linspace(0.0, 1.0, n_points)
+    temperature = np.full((n_samples, n_points), 1.0e4)
+    density_D = np.full((n_samples, n_points), 4.0e19)
+    density_T = np.zeros((n_samples, n_points))
+
+    ens = openmc.TokamakSourceEnsemble(
+        major_radius=300.0,
+        minor_radius=100.0,
+        elongation=1.5,
+        triangularity=0.3,
+        r_over_a=r_over_a,
+        temperature=temperature,
+        density_D=density_D,
+        density_T=density_T,
+    )
+
+    # 1. sample() should return only active channels (DD only)
+    sources_raw = ens.sample(0, normalize_strength=False)
+    assert len(sources_raw) == 1
+    assert np.isclose(sources_raw[0].strength, ens.strength_DD[0])
+
+    sources_norm = ens.sample(0, normalize_strength=True)
+    assert len(sources_norm) == 1
+    assert np.isclose(sources_norm[0].strength, 1.0)
+
+    # 2. sample_reaction('DD') and 'total' should succeed
+    src_dd = ens.sample_reaction(0, reaction='DD')
+    assert isinstance(src_dd, openmc.TokamakSource)
+    assert np.isclose(src_dd.strength, ens.strength_DD[0])
+
+    src_tot = ens.sample_reaction(0, reaction='total')
+    assert isinstance(src_tot, openmc.TokamakSource)
+    assert np.isclose(src_tot.strength, ens.strength_DD[0])
+
+    # 3. Inactive reaction 'DT' should raise a clear ValueError
+    with pytest.raises(ValueError, match="Cannot sample 'DT' reaction"):
+        ens.sample_reaction(0, reaction='DT')
+
+    # 4. Inactive reaction 'TT' should raise a clear ValueError
+    with pytest.raises(ValueError, match="Cannot sample 'TT' reaction"):
+        ens.sample_reaction(0, reaction='TT')
+
