@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -373,13 +375,10 @@ def test_tokamak_source_ensemble_kl_and_slicing():
     assert isinstance(sub_ens, openmc.TokamakSourceEnsemble)
     assert len(sub_ens) == 2
 
-    # Test reaction sampling
-    src_dt = ensemble.sample_reaction(0, reaction='DT')
-    assert isinstance(src_dt, openmc.TokamakSource)
-    assert src_dt.strength > 0
-
-    src_tot = ensemble.sample_reaction(0, reaction='total')
-    assert isinstance(src_tot, openmc.TokamakSource)
+    # Test normalized sampling
+    sources_norm = ensemble.sample(0, normalize_strength=True)
+    assert len(sources_norm) == 3
+    assert np.isclose(sum(s.strength for s in sources_norm), 1.0)
 
     # Test KL expansion helper method directly
     cov = np.eye(5) * 0.1
@@ -617,6 +616,46 @@ def test_native_imas_netcdf_reader(tmp_path):
     assert np.isclose(src.shafranov_shift, 10.0)  # R_mag - R0 = 3.1 - 3.0 = 0.1 m = 10 cm
 
 
+def test_from_imas_te_and_boundary_fallback():
+    """Verify fallback to Te when Ti is absent, and boundary dimensions when r_inboard is absent."""
+    from omas import ODS
+
+    ods = ODS(consistency_check=False)
+    ods['core_profiles.profiles_1d.0.grid.rho_tor_norm'] = np.linspace(0, 1, 10)
+    ods['core_profiles.profiles_1d.0.electrons.density'] = np.full(10, 2e20)
+    ods['core_profiles.profiles_1d.0.electrons.temperature'] = np.full(10, 3000.0)
+
+    ods['equilibrium.time_slice.0.profiles_1d.rho_tor_norm'] = np.linspace(0, 1, 10)
+    ods['equilibrium.time_slice.0.boundary.geometric_axis.r'] = 0.68
+    ods['equilibrium.time_slice.0.boundary.minor_radius'] = 0.22
+    ods['equilibrium.time_slice.0.boundary.elongation'] = 1.6
+    ods['equilibrium.time_slice.0.boundary.triangularity'] = 0.4
+    ods['equilibrium.time_slice.0.global_quantities.magnetic_axis.r'] = 0.70
+
+    with pytest.warns(UserWarning, match='thermal equilibrium T_i = T_e'):
+        with pytest.warns(UserWarning, match='Using boundary scalar dimensions'):
+            src = openmc.TokamakSource.from_imas(ods)
+
+    assert isinstance(src, openmc.TokamakSource)
+    assert np.isclose(src.major_radius, 68.0)
+    assert np.isclose(src.minor_radius, 22.0)
+    assert np.isclose(src.shafranov_shift, 2.0)
+
+
+def test_from_imas_missing_dimensions_error():
+    """Verify ValueError is raised when equilibrium dimensions cannot be resolved (no ITER default)."""
+    from omas import ODS
+
+    ods = ODS(consistency_check=False)
+    ods['core_profiles.profiles_1d.0.grid.rho_tor_norm'] = np.linspace(0, 1, 10)
+    ods['core_profiles.profiles_1d.0.electrons.density'] = np.full(10, 2e20)
+    ods['core_profiles.profiles_1d.0.electrons.temperature'] = np.full(10, 3000.0)
+    ods['equilibrium.time_slice.0.profiles_1d.rho_tor_norm'] = np.linspace(0, 1, 10)
+
+    with pytest.raises(ValueError, match="Unable to determine plasma dimensions"):
+        openmc.TokamakSource.from_imas(ods)
+
+
 def test_load_ods_error_handling(tmp_path):
     """Verify error handling in _load_ods for invalid paths and extensions."""
     with pytest.raises(FileNotFoundError, match="Path not found"):
@@ -778,14 +817,20 @@ def test_elongation_without_r_inboard():
         'equilibrium': {
             'time_slice': [{
                 'profiles_1d': {'elongation': elong},
+                'boundary': {
+                    'minor_radius': 1.13,
+                    'geometric_axis': {'r': 3.3},
+                }
             }]
         }
     }
 
-    with pytest.warns(UserWarning, match="No 'r_inboard' and 'r_outboard' found in equilibrium"):
+    with pytest.warns(UserWarning, match="No 1D 'r_inboard' and 'r_outboard' profiles found in equilibrium"):
         data = openmc.TokamakSource._extract_and_map_imas_profiles(ods, n_points=51)
     assert len(data['elongation']) == 51
     assert np.allclose(data['elongation'], 1.6)
+    assert np.isclose(data['a_minor'], 1.13)
+    assert np.isclose(data['R0'], 3.3)
 
 
 def test_invalid_minor_radius_raises():
@@ -900,20 +945,489 @@ def test_tokamak_source_ensemble_single_species_sampling():
     assert len(sources_norm) == 1
     assert np.isclose(sources_norm[0].strength, 1.0)
 
-    # 2. sample_reaction('DD') and 'total' should succeed
-    src_dd = ens.sample_reaction(0, reaction='DD')
+    # 2. Verify zero-density ensemble raises ValueError on sample()
+    ens_zero = openmc.TokamakSourceEnsemble(
+        major_radius=300.0,
+        minor_radius=100.0,
+        elongation=1.5,
+        triangularity=0.3,
+        r_over_a=r_over_a,
+        temperature=temperature,
+        density_D=np.zeros((n_samples, n_points)),
+        density_T=np.zeros((n_samples, n_points)),
+    )
+    with pytest.raises(ValueError, match="No active fusion reaction channels"):
+        ens_zero.sample(0)
+
+
+def test_from_imas_multislice_hdf5(tmp_path):
+    """Verify loading multi-slice native IMAS HDF5 dataset via time_s and time_index."""
+    h5py = pytest.importorskip("h5py")
+
+    # Create synthetic multi-slice IMAS HDF5 files
+    eq_file = tmp_path / 'equilibrium.h5'
+    cp_file = tmp_path / 'core_profiles.h5'
+
+    with h5py.File(eq_file, 'w') as f:
+        f.create_dataset('equilibrium/time', data=np.array([0.5, 1.0]))
+        f.create_dataset('equilibrium/code&output_flag', data=np.array([0, -1], dtype=np.int32))
+        f.create_dataset('equilibrium/time_slice[]&boundary&minor_radius', data=np.array([1.0, 1.1]))
+        f.create_dataset('equilibrium/time_slice[]&boundary&geometric_axis&r', data=np.array([3.0, 3.2]))
+        f.create_dataset('equilibrium/time_slice[]&boundary&elongation', data=np.array([1.4, 1.6]))
+        f.create_dataset('equilibrium/time_slice[]&boundary&triangularity', data=np.array([0.3, 0.4]))
+        f.create_dataset('equilibrium/time_slice[]&global_quantities&magnetic_axis&r', data=np.array([3.05, 3.28]))
+        f.create_dataset('equilibrium/time_slice[]&profiles_1d&rho_tor_norm', data=np.array([
+            np.linspace(0, 1, 11),
+            np.linspace(0, 1, 11)
+        ]))
+
+    with h5py.File(cp_file, 'w') as f:
+        f.create_dataset('core_profiles/time', data=np.array([0.5, 1.0]))
+        f.create_dataset('core_profiles/profiles_1d[]&grid&rho_tor_norm', data=np.array([
+            np.linspace(0, 1, 11),
+            np.linspace(0, 1, 11)
+        ]))
+        f.create_dataset('core_profiles/profiles_1d[]&electrons&density', data=np.array([
+            np.ones(11) * 1e20,
+            np.ones(11) * 2e20
+        ]))
+        f.create_dataset('core_profiles/profiles_1d[]&electrons&temperature', data=np.array([
+            np.linspace(5000, 500, 11),
+            np.linspace(8000, 800, 11)
+        ]))
+
+    # 1. Load slice at t = 1.0 s; verify time_s selection, boundary fallbacks, and output_flag warning
+    with pytest.warns(UserWarning) as record:
+        source_s1 = openmc.TokamakSource.from_imas(tmp_path, time_s=1.0, reaction='DT')
+
+    messages = [str(w.message) for w in record]
+    assert any("boundary scalar dimensions" in m for m in messages)
+    assert any("output_flag=-1" in m for m in messages)
+    assert any("Assuming thermal equilibrium T_i = T_e" in m for m in messages)
+    assert any("Assuming 50:50 D-T plasma" in m for m in messages)
+
+    # In cm: R0=3.2m -> 320cm, a=1.1m -> 110cm
+    assert np.isclose(source_s1.major_radius, 320.0)
+    assert np.isclose(source_s1.minor_radius, 110.0)
+    assert np.isclose(source_s1.elongation[-1], 1.6)
+    assert np.isclose(source_s1.triangularity[-1], 0.4)
+    assert np.isclose(source_s1.shafranov_shift, 8.0)
+
+    # 2. Loading via exact slice index 1 should match time_s = 1.0 s
+    source_idx1 = openmc.TokamakSource.from_imas(tmp_path, time_index=1, reaction='DT')
+    assert np.isclose(source_s1.major_radius, source_idx1.major_radius)
+    assert np.isclose(source_s1.minor_radius, source_idx1.minor_radius)
+    assert np.isclose(source_s1.shafranov_shift, source_idx1.shafranov_shift)
+
+    # 3. Load slice 0 at t = 0.5 s (R0=3.0m -> 300cm, a=1.0m -> 100cm, kappa=1.4)
+    source_s0 = openmc.TokamakSource.from_imas(tmp_path, time_s=0.5, reaction='DT')
+    assert np.isclose(source_s0.major_radius, 300.0)
+    assert np.isclose(source_s0.minor_radius, 100.0)
+    assert np.isclose(source_s0.elongation[-1], 1.4)
+
+    # 4. Out-of-bounds time_index should raise IndexError
+    with pytest.raises(IndexError, match="exceeds available slices"):
+        openmc.TokamakSource.from_imas(tmp_path, time_index=99)
+
+    # 5. TokamakSourceEnsemble.from_imas without covariance should raise ValueError
+    with pytest.raises(ValueError, match="No covariance data found in IMAS core_profiles"):
+        openmc.TokamakSourceEnsemble.from_imas(tmp_path, time_s=1.0)
+
+
+def test_from_imas_vertical_shift_autodetect_and_override():
+    """Verify automatic vertical_shift extraction and user override."""
+    from omas import ODS
+
+    ods = ODS(consistency_check=False)
+    ods['core_profiles.profiles_1d.0.grid.rho_tor_norm'] = np.linspace(0, 1, 10)
+    ods['core_profiles.profiles_1d.0.electrons.density'] = np.full(10, 2e20)
+    ods['core_profiles.profiles_1d.0.electrons.temperature'] = np.full(10, 3000.0)
+
+    ods['equilibrium.time_slice.0.profiles_1d.rho_tor_norm'] = np.linspace(0, 1, 10)
+    ods['equilibrium.time_slice.0.boundary.geometric_axis.r'] = 0.68
+    ods['equilibrium.time_slice.0.boundary.minor_radius'] = 0.22
+    ods['equilibrium.time_slice.0.boundary.elongation'] = 1.6
+    ods['equilibrium.time_slice.0.boundary.triangularity'] = 0.4
+    ods['equilibrium.time_slice.0.global_quantities.magnetic_axis.r'] = 0.70
+    ods['equilibrium.time_slice.0.global_quantities.magnetic_axis.z'] = -0.05
+
+    # 1. Auto-detected vertical shift (in cm: -0.05 m -> -5.0 cm)
+    with pytest.warns(UserWarning):
+        src_auto = openmc.TokamakSource.from_imas(ods)
+    assert np.isclose(src_auto.vertical_shift, -5.0)
+
+    # 2. Explicit float override
+    with pytest.warns(UserWarning):
+        src_override = openmc.TokamakSource.from_imas(ods, vertical_shift=3.5)
+    assert np.isclose(src_override.vertical_shift, 3.5)
+
+    # 3. Explicit zero override
+    with pytest.warns(UserWarning):
+        src_zero = openmc.TokamakSource.from_imas(ods, vertical_shift=0.0)
+    assert np.isclose(src_zero.vertical_shift, 0.0)
+
+
+def test_from_imas_2d_equilibrium_geometric_mapping():
+    """Verify geometric midplane radial mapping extracted from 2D equilibrium grid,
+    including square grid layout (R, Z) and non-monotonic psi turnover outside boundary."""
+    from omas import ODS
+
+    ods = ODS(consistency_check=False)
+    ods['core_profiles.profiles_1d.0.grid.rho_tor_norm'] = np.linspace(0, 1, 11)
+    ods['core_profiles.profiles_1d.0.electrons.density'] = np.full(11, 2e20)
+    ods['core_profiles.profiles_1d.0.electrons.temperature'] = np.full(11, 3000.0)
+
+    ods['equilibrium.time_slice.0.global_quantities.magnetic_axis.r'] = 3.0
+    ods['equilibrium.time_slice.0.global_quantities.magnetic_axis.z'] = 0.0
+    ods['equilibrium.time_slice.0.global_quantities.psi_magnetic_axis'] = 0.0
+    ods['equilibrium.time_slice.0.boundary.psi'] = 1.0
+    ods['equilibrium.time_slice.0.boundary.geometric_axis.r'] = 3.0
+    ods['equilibrium.time_slice.0.boundary.minor_radius'] = 1.0
+    ods['equilibrium.time_slice.0.boundary.elongation'] = 1.0
+    ods['equilibrium.time_slice.0.boundary.triangularity'] = 0.0
+
+    # Square grid (31 x 31) with IMAS (dim1=R, dim2=Z) layout
+    r_grid = np.linspace(1.5, 4.5, 31)
+    z_grid = np.linspace(-1.5, 1.5, 31)
+    R, Z = np.meshgrid(r_grid, z_grid, indexing='ij')
+    # Circular flux surfaces inside plasma, with artificial turnover outside r > 1.2
+    psi_2d = (R - 3.0)**2 + Z**2
+    psi_2d = np.where(np.abs(R - 3.0) > 1.2, 2 * 1.44 - psi_2d, psi_2d)
+
+    ods['equilibrium.time_slice.0.profiles_2d.0.grid.dim1'] = r_grid
+    ods['equilibrium.time_slice.0.profiles_2d.0.grid.dim2'] = z_grid
+    ods['equilibrium.time_slice.0.profiles_2d.0.psi'] = psi_2d
+    psi_norm = np.linspace(0, 1, 11)
+    ods['equilibrium.time_slice.0.profiles_1d.psi_norm'] = psi_norm
+    ods['equilibrium.time_slice.0.profiles_1d.rho_tor_norm'] = np.sqrt(psi_norm)
+
+    data = openmc.TokamakSource._extract_and_map_imas_profiles(ods, n_points=11)
+    assert np.isclose(data['a_minor'], 1.0, atol=1e-2)
+    assert np.isclose(data['major_radius'], 300.0, atol=1e-1)
+    assert data['r_inboard'] is not None and data['r_outboard'] is not None
+
+    # For circular flux surfaces: R_out - R_axis = a * sqrt(psi_N), R_axis - R_in = a * sqrt(psi_N)
+    # In cm: R_axis = 300 cm, a = 100 cm
+    expected_r_geom = 100.0 * np.sqrt(psi_norm)
+    actual_r_geom = 0.5 * (data['r_outboard'] - data['r_inboard'])
+    assert np.allclose(actual_r_geom, expected_r_geom, atol=1.5)
+    assert np.all(np.diff(actual_r_geom) > 0)
+
+
+def test_from_imas_independent_time_bases(tmp_path):
+    """Verify independent time-slice selection when equilibrium and core_profiles have different time grids."""
+    h5py = pytest.importorskip("h5py")
+    eq_file = tmp_path / 'equilibrium.h5'
+    cp_file = tmp_path / 'core_profiles.h5'
+
+    # Equilibrium has 4 slices at [0.0, 0.5, 1.0, 1.5]
+    with h5py.File(eq_file, 'w') as f:
+        f.create_dataset('equilibrium/time', data=np.array([0.0, 0.5, 1.0, 1.5]))
+        f.create_dataset('equilibrium/time_slice[]&boundary&minor_radius', data=np.array([1.0, 1.1, 1.2, 1.3]))
+        f.create_dataset('equilibrium/time_slice[]&boundary&geometric_axis&r', data=np.array([3.0, 3.1, 3.2, 3.3]))
+        f.create_dataset('equilibrium/time_slice[]&global_quantities&magnetic_axis&r', data=np.array([3.0, 3.1, 3.2, 3.3]))
+        f.create_dataset('equilibrium/time_slice[]&profiles_1d&rho_tor_norm', data=np.linspace(0, 1, 11)[None, :].repeat(4, axis=0))
+
+    # Core profiles has 3 slices at [0.0, 0.9, 2.0] with distinct temperatures
+    with h5py.File(cp_file, 'w') as f:
+        f.create_dataset('core_profiles/time', data=np.array([0.0, 0.9, 2.0]))
+        f.create_dataset('core_profiles/profiles_1d[]&grid&rho_tor_norm', data=np.linspace(0, 1, 11)[None, :].repeat(3, axis=0))
+        f.create_dataset('core_profiles/profiles_1d[]&electrons&density', data=np.array([
+            np.full(11, 1e20),
+            np.full(11, 2e20),
+            np.full(11, 3e20)
+        ]))
+        f.create_dataset('core_profiles/profiles_1d[]&electrons&temperature', data=np.array([
+            np.full(11, 1000.0),
+            np.full(11, 2500.0),
+            np.full(11, 4000.0)
+        ]))
+
+    # Target t = 1.0 s: equilibrium should pick idx 2 (t=1.0, a=1.2m), core_profiles should pick idx 1 (t=0.9, Te=2500eV)
+    ods = openmc.TokamakSource._load_ods(tmp_path, time_s=1.0)
+    assert np.isclose(ods['core_profiles.profiles_1d.0.electrons.temperature'][0], 2500.0)
+    assert np.isclose(ods['equilibrium.time_slice.0.boundary.minor_radius'], 1.2)
+
+    src = openmc.TokamakSource.from_imas(tmp_path, time_s=1.0, reaction='DT')
+    assert np.isclose(src.minor_radius, 120.0)
+    assert np.isclose(src.major_radius, 320.0)
+
+
+def test_from_imas_time_warnings():
+    """Verify warnings when time parameters are passed to in-memory ODS or when both time_index and time_s are given."""
+    from omas import ODS
+
+    ods = ODS(consistency_check=False)
+    ods['core_profiles.profiles_1d.0.grid.rho_tor_norm'] = np.linspace(0, 1, 10)
+    ods['core_profiles.profiles_1d.0.electrons.density'] = np.full(10, 2e20)
+    ods['core_profiles.profiles_1d.0.electrons.temperature'] = np.full(10, 3000.0)
+    ods['equilibrium.time_slice.0.profiles_1d.rho_tor_norm'] = np.linspace(0, 1, 10)
+    ods['equilibrium.time_slice.0.boundary.geometric_axis.r'] = 0.68
+    ods['equilibrium.time_slice.0.boundary.minor_radius'] = 0.22
+
+    with pytest.warns(UserWarning) as record:
+        openmc.TokamakSource.from_imas(ods, time_s=1.0)
+    messages = [str(w.message) for w in record]
+    assert any("ignored when imas_input is an in-memory ODS or dict" in m for m in messages)
+
+    with pytest.warns(UserWarning) as record:
+        openmc.TokamakSource._load_ods(ods, time_index=0, time_s=1.0)
+    messages = [str(w.message) for w in record]
+    assert any("Both 'time_index' and 'time_s' were provided" in m for m in messages)
+
+
+def test_dd_neutron_branching_and_tt_multiplicity():
+    """Verify DD reactivity uses the neutron-producing branch DD_n and TT emissivity includes 2n multiplicity."""
+    T_i = np.array([10.0e3, 20.0e3])
+    nD = np.array([5.0e19, 5.0e19])
+    nT = np.array([5.0e19, 5.0e19])
+
+    sv_dd = openmc.TokamakSource._bosch_hale_reactivity(T_i, 'DD')
+    sv_dd_n = openmc.TokamakSource._bosch_hale_reactivity(T_i, 'DD_n')
+    sv_dd_p = openmc.TokamakSource._bosch_hale_reactivity(T_i, 'DD_p')
+    sv_dd_tot = openmc.TokamakSource._bosch_hale_reactivity(T_i, 'DD_total')
+    sv_tt = openmc.TokamakSource._bosch_hale_reactivity(T_i, 'TT')
+
+    # DD neutron reactivity equals DD_n (not DD_n + DD_p)
+    np.testing.assert_allclose(sv_dd, sv_dd_n)
+    np.testing.assert_allclose(sv_dd_tot, sv_dd_n + sv_dd_p)
+    assert np.all(sv_dd_tot > sv_dd)
+
+    # Emissivities
+    em_dd = openmc.TokamakSource._calculate_fusion_emissivity(nD, nT, T_i, reaction='DD')
+    em_dd_n = openmc.TokamakSource._calculate_fusion_emissivity(nD, nT, T_i, reaction='DD_n')
+    np.testing.assert_allclose(em_dd, em_dd_n)
+    np.testing.assert_allclose(em_dd, 0.5 * (nD**2) * sv_dd_n)
+
+    # TT produces 2 neutrons per reaction: 2 * 0.5 * n_T^2 * <sigma*v>_TT = n_T^2 * <sigma*v>_TT
+    em_tt = openmc.TokamakSource._calculate_fusion_emissivity(nD, nT, T_i, reaction='TT')
+    np.testing.assert_allclose(em_tt, (nT**2) * sv_tt)
+
+
+def test_from_imas_single_species_error():
+    """Verify that requesting DT reaction on a pure-D plasma raises a clear ValueError in from_imas."""
+    from omas import ODS
+
+    ods = ODS(consistency_check=False)
+    ods['core_profiles.profiles_1d.0.grid.rho_tor_norm'] = np.linspace(0, 1, 10)
+    ods['core_profiles.profiles_1d.0.t_i_average'] = np.full(10, 5000.0)
+    ods['core_profiles.profiles_1d.0.ion.0.name'] = 'D'
+    ods['core_profiles.profiles_1d.0.ion.0.density'] = np.full(10, 1.0e20)
+
+    ods['equilibrium.time_slice.0.profiles_1d.r_inboard'] = np.linspace(2.0, 1.0, 10)
+    ods['equilibrium.time_slice.0.profiles_1d.r_outboard'] = np.linspace(2.0, 3.0, 10)
+    ods['equilibrium.time_slice.0.profiles_1d.rho_tor_norm'] = np.linspace(0, 1, 10)
+
+    # 1. Default reaction='DT' on pure-D plasma raises descriptive ValueError
+    with pytest.warns(UserWarning, match="Assuming Tritium density is zero"):
+        with pytest.raises(ValueError, match="Cannot construct a 'DT' TokamakSource because Tritium density is zero"):
+            openmc.TokamakSource.from_imas(ods, reaction='DT')
+
+    # 2. Specifying reaction='DD' succeeds cleanly
+    src_dd = openmc.TokamakSource.from_imas(ods, reaction='DD')
     assert isinstance(src_dd, openmc.TokamakSource)
-    assert np.isclose(src_dd.strength, ens.strength_DD[0])
+    assert np.any(src_dd.emission_density > 0.0)
 
-    src_tot = ens.sample_reaction(0, reaction='total')
-    assert isinstance(src_tot, openmc.TokamakSource)
-    assert np.isclose(src_tot.strength, ens.strength_DD[0])
 
-    # 3. Inactive reaction 'DT' should raise a clear ValueError
-    with pytest.raises(ValueError, match="Cannot sample 'DT' reaction"):
-        ens.sample_reaction(0, reaction='DT')
+def test_from_imas_species_ion_temperature_fallback():
+    """Verify fallback to ion[].temperature when t_i_average is absent."""
+    from omas import ODS
 
-    # 4. Inactive reaction 'TT' should raise a clear ValueError
-    with pytest.raises(ValueError, match="Cannot sample 'TT' reaction"):
-        ens.sample_reaction(0, reaction='TT')
+    ods = ODS(consistency_check=False)
+    rho = np.linspace(0.0, 1.0, 11)
+
+    ods['core_profiles.profiles_1d.0.grid.rho_tor_norm'] = rho
+    ods['core_profiles.profiles_1d.0.ion.0.name'] = 'D'
+    ods['core_profiles.profiles_1d.0.ion.0.density'] = np.full(11, 5.0e19)
+    ods['core_profiles.profiles_1d.0.ion.0.temperature'] = 8000.0 * (1.0 - rho**2) + 500.0
+    ods['core_profiles.profiles_1d.0.ion.1.name'] = 'T'
+    ods['core_profiles.profiles_1d.0.ion.1.density'] = np.full(11, 5.0e19)
+    ods['core_profiles.profiles_1d.0.electrons.temperature'] = np.full(11, 2000.0)
+
+    ods['equilibrium.time_slice.0.profiles_1d.r_inboard'] = np.linspace(3.0, 2.0, 11)
+    ods['equilibrium.time_slice.0.profiles_1d.r_outboard'] = np.linspace(3.0, 4.0, 11)
+    ods['equilibrium.time_slice.0.profiles_1d.rho_tor_norm'] = rho
+
+    with pytest.warns(UserWarning, match="using species ion temperature from 'ion\\[\\].temperature'"):
+        data = openmc.TokamakSource._extract_and_map_imas_profiles(ods, n_points=11)
+
+    assert np.isclose(data['temperature'][0], 8500.0)
+
+
+def test_tokamak_source_xml_roundtrip_method_and_primes():
+    """Verify XML roundtrip preserves method ('bernstein' vs 'fourier') and derivative profiles."""
+    r_over_a = np.linspace(0.0, 1.0, 11)
+    emission = np.maximum(0.0, 1.0 - r_over_a**2)
+    energy = openmc.stats.Discrete([14.08e6], [1.0])
+
+    # 1. Bernstein scalar source roundtrip
+    src_bern = openmc.TokamakSource(
+        major_radius=620.0,
+        minor_radius=200.0,
+        elongation=1.7,
+        triangularity=0.33,
+        shafranov_shift=10.0,
+        r_over_a=r_over_a,
+        emission_density=emission,
+        energy=energy,
+        method='bernstein',
+    )
+    elem_bern = src_bern.to_xml_element()
+    assert elem_bern.find('elongation_prime') is None
+    src_bern_rt = openmc.TokamakSource.from_xml_element(elem_bern)
+    assert src_bern_rt.method == 'bernstein'
+    assert isinstance(src_bern_rt.elongation, float)
+    assert isinstance(src_bern_rt.triangularity, float)
+
+    # 2. Fourier profile source roundtrip
+    kappa_prof = 1.4 + 0.4 * r_over_a**2
+    delta_prof = 0.35 * r_over_a**2
+    src_four = openmc.TokamakSource(
+        major_radius=620.0,
+        minor_radius=200.0,
+        elongation=kappa_prof,
+        triangularity=delta_prof,
+        shafranov_shift=10.0,
+        r_over_a=r_over_a,
+        emission_density=emission,
+        energy=energy,
+        method='fourier',
+    )
+    elem_four = src_four.to_xml_element()
+    assert elem_four.find('elongation_prime') is not None
+    src_four_rt = openmc.TokamakSource.from_xml_element(elem_four)
+    assert src_four_rt.method == 'fourier'
+    np.testing.assert_allclose(src_four_rt._kappa_prime, src_four._kappa_prime)
+    np.testing.assert_allclose(src_four_rt._delta_prime, src_four._delta_prime)
+
+
+def test_tokamak_source_non_positive_jacobian():
+    """Verify non-positive radial flux-surface Jacobian raises ValueError."""
+    r_over_a = np.linspace(0.0, 1.0, 21)
+    emission = np.maximum(0.0, 1.0 - r_over_a**2)
+    energy = openmc.stats.Discrete([14.08e6], [1.0])
+    # Steeply decreasing elongation where kappa + r_tilde * kappa' <= 0 near edge
+    bad_elongation = 1.8 - 1.2 * r_over_a**2
+
+    with pytest.raises(ValueError, match="Non-positive vertical Jacobian"):
+        openmc.TokamakSource(
+            major_radius=620.0,
+            minor_radius=200.0,
+            elongation=bad_elongation,
+            triangularity=0.3,
+            shafranov_shift=0.0,
+            r_over_a=r_over_a,
+            emission_density=emission,
+            energy=energy,
+            method='fourier',
+        )
+
+
+def test_integrated_source_strength_profile_derivatives():
+    """Verify _calculate_integrated_source_strength matches 2D numerical quadrature when kappa' and delta' != 0."""
+    from scipy.interpolate import CubicSpline
+
+    r_tilde = np.linspace(0.0, 1.0, 201)
+    R0_m = 6.2
+    a_m = 2.0
+    shift_m = 0.15
+    kappa = 1.3 + 0.6 * r_tilde**2
+    delta = 0.45 * r_tilde**2
+    S_profile = 1.0e18 * (1.0 - r_tilde**2) ** 2
+
+    strength_analytic = openmc.TokamakSourceEnsemble._calculate_integrated_source_strength(
+        S_profile=S_profile,
+        r_over_a=r_tilde,
+        major_radius=R0_m * 100.0,
+        minor_radius=a_m * 100.0,
+        elongation=kappa,
+        triangularity=delta,
+        shafranov_shift=shift_m * 100.0,
+    )
+
+    # Direct 2D numerical quadrature in (r_tilde, alpha)
+    kp = CubicSpline(r_tilde, kappa, bc_type=((1, 0.0), 'not-a-knot')).derivative()(r_tilde)
+    dp = CubicSpline(r_tilde, delta, bc_type=((1, 0.0), 'not-a-knot')).derivative()(r_tilde)
+    alpha = np.linspace(0.0, 2.0 * np.pi, 401)
+    rr, aa = np.meshgrid(r_tilde, alpha, indexing='ij')
+    kk = kappa[:, np.newaxis]
+    dd = delta[:, np.newaxis]
+    kkp = kp[:, np.newaxis]
+    ddp = dp[:, np.newaxis]
+
+    R_grid = R0_m + shift_m * (1.0 - rr**2) + a_m * rr * np.cos(aa + dd * np.sin(aa))
+    dR_dr = -2.0 * shift_m * rr + a_m * np.cos(aa + dd * np.sin(aa)) - a_m * rr * ddp * np.sin(aa) * np.sin(aa + dd * np.sin(aa))
+    dR_da = -a_m * rr * (1.0 + dd * np.cos(aa)) * np.sin(aa + dd * np.sin(aa))
+    dz_dr = a_m * (kk + rr * kkp) * np.sin(aa)
+    dz_da = a_m * rr * kk * np.cos(aa)
+    J_pol = np.abs(dR_dr * dz_da - dR_da * dz_dr)
+
+    trapz_fn = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
+    dV_dr_num = 2.0 * np.pi * trapz_fn(R_grid * J_pol, alpha, axis=1)
+    strength_num = float(trapz_fn(S_profile * dV_dr_num, r_tilde))
+
+    assert np.isclose(strength_analytic, strength_num, rtol=1e-4)
+
+
+def test_from_imas_ensemble_density_correlation_and_cross_covariance():
+    """Verify TokamakSourceEnsemble.from_imas preserves D/T correlation (quasi-neutrality) and (T_i, n_e) cross-covariance."""
+    from omas import ODS
+
+    n_grid = 11
+    rho = np.linspace(0.0, 1.0, n_grid)
+
+    def make_ods(cross_corr: float = 0.0):
+        ods = ODS(consistency_check=False)
+        ods['core_profiles.profiles_1d.0.grid.rho_tor_norm'] = rho
+        T_prof = 15000.0 * (1.0 - 0.8 * rho**2)
+        ne_prof = 1.0e20 * (1.0 - 0.5 * rho**2)
+        ods['core_profiles.profiles_1d.0.t_i_average'] = T_prof
+        ods['core_profiles.profiles_1d.0.electrons.density'] = ne_prof
+        ods['core_profiles.profiles_1d.0.ion.0.name'] = 'D'
+        ods['core_profiles.profiles_1d.0.ion.0.density'] = 0.5 * ne_prof
+        ods['core_profiles.profiles_1d.0.ion.1.name'] = 'T'
+        ods['core_profiles.profiles_1d.0.ion.1.density'] = 0.5 * ne_prof
+
+        ods['equilibrium.time_slice.0.profiles_1d.r_inboard'] = 6.2 - 2.0 * rho
+        ods['equilibrium.time_slice.0.profiles_1d.r_outboard'] = 6.2 + 2.0 * rho
+        ods['equilibrium.time_slice.0.profiles_1d.rho_tor_norm'] = rho
+
+        # Construct smooth spatial kernel covariance for (T_i, n_e)
+        dist_sq = (rho[:, None] - rho[None, :]) ** 2
+        K = np.exp(-dist_sq / (2.0 * 0.25**2))
+        sigma_T = 0.10 * T_prof
+        sigma_ne = 0.10 * ne_prof
+        cov_T = np.outer(sigma_T, sigma_T) * K
+        cov_ne = np.outer(sigma_ne, sigma_ne) * K
+        cov_T_ne = cross_corr * np.outer(sigma_T, sigma_ne) * K
+
+        full_cov = np.block([[cov_T, cov_T_ne], [cov_T_ne.T, cov_ne]])
+        rows_uri = (
+            [f"core_profiles.profiles_1d[0].t_i_average[{i}]" for i in range(n_grid)]
+            + [f"core_profiles.profiles_1d[0].electrons.density[{i}]" for i in range(n_grid)]
+        )
+        ods['core_profiles.covariance.data'] = full_cov
+        ods['core_profiles.covariance.rows_uri'] = rows_uri
+        return ods
+
+    # 1. Block-diagonal covariance: verify D and T perturbations are perfectly correlated (quasi-neutrality)
+    ods_diag = make_ods(cross_corr=0.0)
+    ens_diag = openmc.TokamakSourceEnsemble.from_imas(
+        ods_diag, n_samples=500, kl_components=0.999, n_points=n_grid, random_seed=42
+    )
+    corr_nD_nT_axis = np.corrcoef(ens_diag.density_D[:, 0], ens_diag.density_T[:, 0])[0, 1]
+    assert corr_nD_nT_axis > 0.999
+    # Verify Var(n_D + n_T) == 4 * Var(n_D) == Var(n_e)
+    var_sum = np.var(ens_diag.density_D[:, 0] + ens_diag.density_T[:, 0], ddof=1)
+    var_nD = np.var(ens_diag.density_D[:, 0], ddof=1)
+    assert np.isclose(var_sum, 4.0 * var_nD, rtol=1e-5)
+
+    # 2. Cross-correlated (T_i, n_e) covariance: verify joint KL expansion preserves T_i - n_D correlation
+    ods_corr = make_ods(cross_corr=0.8)
+    ens_corr = openmc.TokamakSourceEnsemble.from_imas(
+        ods_corr, n_samples=1000, kl_components=0.999, n_points=n_grid, random_seed=42
+    )
+    corr_T_nD_axis = np.corrcoef(ens_corr.temperature[:, 0], ens_corr.density_D[:, 0])[0, 1]
+    assert np.isclose(corr_T_nD_axis, 0.8, atol=0.08)
+
 

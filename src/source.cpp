@@ -1173,22 +1173,13 @@ int TokamakSource::compute_sum_size(double error_tol) const
 
 void TokamakSource::precompute_fourier_distributions()
 {
-  double eps = epsilon_;
-  double Dt = delta_tilde_;
   size_t n_r = r_over_a_.size();
 
   //==========================================================================
   // 1. MARGINAL RADIAL DISTRIBUTION p(r_tilde)
   //==========================================================================
   // Analytically integrate the joint density R_tilde * J_tilde over poloidal angle alpha:
-  //   p(r) ~ S(r) * r * M(r)
-  // where:
-  //   M(r) = (1 + eps*Dt - eps*Dt*r^2) * T1(r) + eps*r*pi * T2(r)
-  // with:
-  //   T1(r) = 2*pi*(k + kp*r/2)*J0(d) - pi*kp*r*J2(d) + (pi*A/2)*(J1(d) + J3(d))
-  //   T2(r) = -(k + kp*r/2)*J1(2d) + (kp*r/2)*J3(2d) + (A/4)*(J0(2d) - J4(2d)) - 2*k*Dt*r*(J0(d) + J2(d))
-  //   A(r)  = k*d - k*r*dp + kp*r*d
-
+  //   p(r) ~ S(r) * r * 2*pi * c_hat_0(r)
   // Build a refined radial grid to resolve fine features in emission and geometric profiles
   constexpr int MIN_SUBINTERVALS = 8;
   constexpr double MAX_GRID_SPACING = 1.0e-3;
@@ -1212,30 +1203,16 @@ void TokamakSource::precompute_fourier_distributions()
   vector<double> radial_pdf(radial_grid.size());
   for (size_t i = 0; i < radial_grid.size(); ++i) {
     double r = radial_grid[i];
-    double k = get_elongation(r);
-    double d = get_triangularity(r);
-
-    // Linear interpolation of spatial derivatives for intermediate subintervals
-    size_t idx = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r);
+    size_t idx = std::max<ptrdiff_t>(
+      0, lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r));
     if (idx >= n_r - 1) idx = n_r - 2;
     double t = (r - r_over_a_[idx]) / (r_over_a_[idx + 1] - r_over_a_[idx]);
+    double k = (1.0 - t) * elongation_profile_[idx] + t * elongation_profile_[idx + 1];
+    double d = (1.0 - t) * triangularity_profile_[idx] + t * triangularity_profile_[idx + 1];
     double kp = (1.0 - t) * elongation_prime_[idx] + t * elongation_prime_[idx + 1];
     double dp = (1.0 - t) * triangularity_prime_[idx] + t * triangularity_prime_[idx + 1];
-    double A = (k * d) - (k * r * dp) + (kp * r * d);
-
-    double T1 = 2.0 * PI * (k + 0.5 * kp * r) * bessel_j(0, d) -
-                PI * kp * r * bessel_j(2, d) +
-                0.5 * PI * A * (bessel_j(1, d) + bessel_j(3, d));
-
-    double T2 = -(k + 0.5 * kp * r) * bessel_j(1, 2.0 * d) +
-                0.5 * kp * r * bessel_j(3, 2.0 * d) +
-                0.25 * A * (bessel_j(0, 2.0 * d) - bessel_j(4, 2.0 * d)) -
-                2.0 * k * Dt * r * (bessel_j(0, d) + bessel_j(2, d));
-
-    double geometric_factor =
-      (1.0 + eps * Dt - eps * Dt * r * r) * T1 + eps * r * PI * T2;
-
-    radial_pdf[i] = radial_emission[i] * r * std::max(0.0, geometric_factor);
+    double c0 = compute_fourier_coeff(0, r, k, kp, d, dp);
+    radial_pdf[i] = radial_emission[i] * r * std::max(0.0, 2.0 * PI * c0);
   }
 
   // Normalize and construct Tabular radial distribution
@@ -1255,18 +1232,6 @@ void TokamakSource::precompute_fourier_distributions()
   //==========================================================================
   // 2. POLOIDAL CONDITIONAL DISTRIBUTIONS P(alpha | r_i)
   //==========================================================================
-  // The conditional distribution P(alpha | r) is represented by a Fourier series:
-  //   P(alpha | r) = (1 / (2*pi*c_hat_0(r))) * sum_n c_hat_n(r) * exp(i*n*alpha)
-  //
-  // Integrating over [0, alpha] gives the exact analytic cumulative distribution:
-  //   F(alpha | r) = alpha / (2*pi) + (1 / (pi*c_hat_0(r))) * sum_{n=1}^N (c_hat_n(r) / n) * sin(n*alpha)
-  //
-  // Exploiting up-down symmetry across [0, pi] and normalizing on [0, pi]:
-  //   F_half(alpha | r) = alpha / pi + (2 / (pi*c_hat_0(r))) * sum_{n=1}^N (c_hat_n(r) / n) * sin(n*alpha)
-  //
-  // Truncation at N = 30 modes guarantees machine-level precision (< 1e-13 error)
-  // due to the super-exponential decay J_n(delta) ~ (e*delta / 2n)^n / sqrt(2*pi*n).
-
   int n_alpha = n_alpha_;
   vector<double> alpha_grid(n_alpha);
   double dalpha = PI / (n_alpha - 1);
@@ -1287,20 +1252,30 @@ void TokamakSource::precompute_fourier_distributions()
 
     // Compute Fourier coefficients c_hat_n for n = 0 ... n_fourier
     double c0 = compute_fourier_coeff(0, r, k, kp, d, dp);
+    if (c0 <= 0.0) {
+      fatal_error(
+        "TokamakSource: Non-positive flux-surface Jacobian (c0 <= 0) "
+        "detected. Check elongation and triangularity profiles for "
+        "overlapping flux surfaces.");
+    }
     vector<double> cn(n_fourier + 1);
     for (int n = 1; n <= n_fourier; ++n) {
       cn[n] = compute_fourier_coeff(n, r, k, kp, d, dp);
     }
 
-    // Evaluate normalized analytic CDF on alpha in [0, pi]
+    // Evaluate normalized analytic CDF and PDF on alpha in [0, pi]
     vector<double> cdf_half(n_alpha);
+    vector<double> pdf_half(n_alpha);
     for (int j = 0; j < n_alpha; ++j) {
       double alpha = alpha_grid[j];
-      double sum_terms = 0.0;
+      double sum_cdf = 0.0;
+      double sum_pdf = 0.0;
       for (int n = 1; n <= n_fourier; ++n) {
-        sum_terms += (cn[n] / n) * std::sin(n * alpha);
+        sum_cdf += (cn[n] / n) * std::sin(n * alpha);
+        sum_pdf += 2.0 * (cn[n] / c0) * std::cos(n * alpha);
       }
-      cdf_half[j] = (alpha / PI) + (2.0 / (PI * c0)) * sum_terms;
+      cdf_half[j] = (alpha / PI) + (2.0 / (PI * c0)) * sum_cdf;
+      pdf_half[j] = std::max(0.0, (1.0 + sum_pdf) / PI);
     }
 
     // Enforce exact boundary values and monotonicity
@@ -1309,17 +1284,6 @@ void TokamakSource::precompute_fourier_distributions()
     for (int j = 1; j < n_alpha; ++j) {
       if (cdf_half[j] < cdf_half[j - 1]) cdf_half[j] = cdf_half[j - 1];
       if (cdf_half[j] > 1.0) cdf_half[j] = 1.0;
-    }
-
-    // Evaluate corresponding PDF values on alpha in [0, pi]
-    vector<double> pdf_half(n_alpha);
-    for (int j = 0; j < n_alpha; ++j) {
-      double alpha = alpha_grid[j];
-      double sum_p = 0.0;
-      for (int n = 1; n <= n_fourier; ++n) {
-        sum_p += 2.0 * (cn[n] / c0) * std::cos(n * alpha);
-      }
-      pdf_half[j] = std::max(0.0, (1.0 + sum_p) / PI);
     }
 
     // Construct fast inverse-CDF Tabular distribution for this radial point
@@ -1358,7 +1322,8 @@ double TokamakSource::mixture_weight(int k, double r) const
 double TokamakSource::get_elongation(double r_norm) const
 {
   if (!is_profile_) return elongation_;
-  size_t i = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm);
+  size_t i = std::max<ptrdiff_t>(
+    0, lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm));
   if (i >= elongation_profile_.size() - 1) {
     return elongation_profile_.back();
   }
@@ -1369,7 +1334,8 @@ double TokamakSource::get_elongation(double r_norm) const
 double TokamakSource::get_triangularity(double r_norm) const
 {
   if (!is_profile_) return triangularity_;
-  size_t i = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm);
+  size_t i = std::max<ptrdiff_t>(
+    0, lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm));
   if (i >= triangularity_profile_.size() - 1) {
     return triangularity_profile_.back();
   }
@@ -1441,7 +1407,8 @@ double TokamakSource::sample_poloidal_angle_fourier(
 {
   r_norm = std::clamp(r_norm, 0.0, 1.0);
   // Multiple distributions: stochastic selection between bracketing r points
-  size_t i = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm);
+  size_t i = std::max<ptrdiff_t>(
+    0, lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm));
   size_t idx;
   if (i >= fourier_poloidal_dists_.size() - 1) {
     idx = fourier_poloidal_dists_.size() - 1;
@@ -1472,7 +1439,8 @@ std::pair<double, double> TokamakSource::sample_energy(
 
   // Multiple distributions: stochastic selection between bracketing r points
   // Find the interval containing r_norm
-  size_t i = lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm);
+  size_t i = std::max<ptrdiff_t>(
+    0, lower_bound_index(r_over_a_.begin(), r_over_a_.end(), r_norm));
 
   // Handle boundary cases
   if (i >= energy_dists_.size() - 1) {

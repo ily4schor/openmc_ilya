@@ -10,6 +10,9 @@ import lxml.etree as ET
 import numpy as np
 import h5py
 import pandas as pd
+from scipy.interpolate import CubicSpline, PchipInterpolator, RegularGridInterpolator
+from scipy.linalg import eigh
+from scipy.special import jv
 
 import openmc
 import openmc.checkvalue as cv
@@ -1028,6 +1031,7 @@ class TokamakSource(SourceBase):
         self.shafranov_shift = shafranov_shift
         if method not in ('fourier', 'bernstein'):
             raise ValueError(f"Invalid method '{method}'. Valid options are 'fourier' or 'bernstein'.")
+        self._method = method
         if method == 'bernstein':
             if isinstance(elongation, Iterable) or isinstance(triangularity, Iterable):
                 raise ValueError("Bernstein method requires scalar elongation and triangularity.")
@@ -1036,9 +1040,10 @@ class TokamakSource(SourceBase):
             self.triangularity = float(triangularity)
         else:  # 'fourier' (default for both profiles and scalars)
             self._is_profile = True
-            from scipy.interpolate import CubicSpline
-            self.elongation = np.asarray(elongation) if isinstance(elongation, Iterable) else np.full_like(self.r_over_a, float(elongation))
-            self.triangularity = np.asarray(triangularity) if isinstance(triangularity, Iterable) else np.full_like(self.r_over_a, float(triangularity))
+            is_elong_iter = isinstance(elongation, Iterable)
+            is_triang_iter = isinstance(triangularity, Iterable)
+            self.elongation = np.asarray(elongation, dtype=float) if is_elong_iter else np.full_like(self.r_over_a, float(elongation))
+            self.triangularity = np.asarray(triangularity, dtype=float) if is_triang_iter else np.full_like(self.r_over_a, float(triangularity))
             if len(self.elongation) != len(self.r_over_a):
                 raise ValueError(
                     f"elongation profile (length {len(self.elongation)}) must "
@@ -1047,9 +1052,19 @@ class TokamakSource(SourceBase):
                 raise ValueError(
                     f"triangularity profile (length {len(self.triangularity)}) must "
                     f"have the same length as r_over_a (length {len(self.r_over_a)})")
-            bc = ((1, 0.0), 'not-a-knot')
-            self._kappa_prime = CubicSpline(self.r_over_a, self.elongation, bc_type=bc).derivative()(self.r_over_a)
-            self._delta_prime = CubicSpline(self.r_over_a, self.triangularity, bc_type=bc).derivative()(self.r_over_a)
+            if is_elong_iter or is_triang_iter:
+                bc = ((1, 0.0), 'not-a-knot')
+                self._kappa_prime = (
+                    CubicSpline(self.r_over_a, self.elongation, bc_type=bc).derivative()(self.r_over_a)
+                    if is_elong_iter else np.zeros_like(self.r_over_a)
+                )
+                self._delta_prime = (
+                    CubicSpline(self.r_over_a, self.triangularity, bc_type=bc).derivative()(self.r_over_a)
+                    if is_triang_iter else np.zeros_like(self.r_over_a)
+                )
+            else:
+                self._kappa_prime = np.zeros_like(self.r_over_a)
+                self._delta_prime = np.zeros_like(self.r_over_a)
         self.emission_density = emission_density
         self.phi_start = phi_start
         self.phi_extent = phi_extent
@@ -1081,18 +1096,20 @@ class TokamakSource(SourceBase):
                 f"Number of energy distributions ({len(self.energy)}) must be "
                 f"either 1 or equal to the number of r_over_a grid points "
                 f"({len(self.r_over_a)})")
-        if isinstance(self.elongation, np.ndarray) and len(self.elongation) != len(self.r_over_a):
-            raise ValueError(
-                f"elongation profile (length {len(self.elongation)}) must "
-                f"have the same length as r_over_a (length {len(self.r_over_a)})")
-        if isinstance(self.triangularity, np.ndarray) and len(self.triangularity) != len(self.r_over_a):
-            raise ValueError(
-                f"triangularity profile (length {len(self.triangularity)}) must "
-                f"have the same length as r_over_a (length {len(self.r_over_a)})")
+        if self._is_profile and hasattr(self, '_kappa_prime'):
+            if np.any(self.elongation + self.r_over_a * self._kappa_prime <= 0.0):
+                raise ValueError(
+                    "Non-positive vertical Jacobian (kappa + r * kappa' <= 0) detected; "
+                    "flux surfaces overlap."
+                )
 
     @property
     def type(self) -> str:
         return "tokamak"
+
+    @property
+    def method(self) -> str:
+        return self._method
 
     @property
     def major_radius(self) -> float:
@@ -1355,7 +1372,13 @@ class TokamakSource(SourceBase):
         strength_text = get_text(elem, 'strength')
         strength = float(strength_text) if strength_text else 1.0
 
-        return cls(
+        elong_prime_elem = elem.find('elongation_prime')
+        triang_prime_elem = elem.find('triangularity_prime')
+        has_prime = elong_prime_elem is not None or triang_prime_elem is not None
+        is_profile = isinstance(elongation, list) or isinstance(triangularity, list)
+        method = 'fourier' if (has_prime or is_profile) else 'bernstein'
+
+        src = cls(
             major_radius=major_radius,
             minor_radius=minor_radius,
             elongation=elongation,
@@ -1364,6 +1387,7 @@ class TokamakSource(SourceBase):
             r_over_a=r_over_a,
             emission_density=emission_density,
             energy=energy,
+            method=method,
             time=time,
             phi_start=phi_start,
             phi_extent=phi_extent,
@@ -1372,6 +1396,16 @@ class TokamakSource(SourceBase):
             strength=strength,
             constraints=constraints
         )
+        if elong_prime_elem is not None and elong_prime_elem.text:
+            src._kappa_prime = np.array([float(x) for x in elong_prime_elem.text.split()])
+        if triang_prime_elem is not None and triang_prime_elem.text:
+            src._delta_prime = np.array([float(x) for x in triang_prime_elem.text.split()])
+        if has_prime and np.any(src.elongation + src.r_over_a * src._kappa_prime <= 0.0):
+            raise ValueError(
+                "Non-positive vertical Jacobian (kappa + r * kappa' <= 0) detected; "
+                "flux surfaces overlap."
+            )
+        return src
     
     @classmethod
     def from_profiles(
@@ -1514,10 +1548,21 @@ class TokamakSource(SourceBase):
         }
 
         if reaction == 'DD':
+            return TokamakSource._bosch_hale_reactivity(T_i, 'DD_n')
+        if reaction == 'DD_total':
             return TokamakSource._bosch_hale_reactivity(T_i, 'DD_n') + TokamakSource._bosch_hale_reactivity(T_i, 'DD_p')
 
         if reaction not in PARAMS:
-            raise ValueError(f"Unknown reaction '{reaction}'. Valid options: 'DT', 'DD', 'DD_n', 'DD_p', 'TT'")
+            raise ValueError(f"Unknown reaction '{reaction}'. Valid options: 'DT', 'DD', 'DD_n', 'DD_p', 'DD_total', 'TT'")
+
+        if np.any(T_kev > 100.0):
+            warnings.warn(
+                f"Ion temperature exceeds 100 keV (max={float(np.max(T_kev)):.1f} keV), "
+                f"which is outside the calibrated validity range [0.2, 100] keV of the "
+                f"Bosch-Hale {reaction} reactivity parameterization.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         p = PARAMS[reaction]
         num = T_kev * (p['C2'] + T_kev * (p['C4'] + T_kev * p['C6']))
@@ -1542,16 +1587,18 @@ class TokamakSource(SourceBase):
 
         if reaction == 'DT':
             return nD_arr * nT_arr * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DT')
-        elif reaction == 'DD':
-            return 0.5 * (nD_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DD')
-        elif reaction == 'DD_n':
+        elif reaction in ('DD', 'DD_n'):
             return 0.5 * (nD_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DD_n')
         elif reaction == 'DD_p':
             return 0.5 * (nD_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DD_p')
+        elif reaction == 'DD_total':
+            return 0.5 * (nD_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'DD_total')
         elif reaction == 'TT':
-            return 0.5 * (nT_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'TT')
+            # T(t, 2n)alpha produces 2 neutrons per reaction event:
+            # S_n = 2 * (1/2 * n_T^2 * <sigma*v>_TT) = n_T^2 * <sigma*v>_TT
+            return (nT_arr**2) * TokamakSource._bosch_hale_reactivity(Ti_arr, 'TT')
         else:
-            raise ValueError(f"Invalid reaction '{reaction}'. Valid options: 'DT', 'DD', 'DD_n', 'DD_p', 'TT'")
+            raise ValueError(f"Invalid reaction '{reaction}'. Valid options: 'DT', 'DD', 'DD_n', 'DD_p', 'DD_total', 'TT'")
 
     @staticmethod
     def _ballabio_energy_spectrum(T_i: float | Sequence[float], reaction: str = 'DT') -> Any:
@@ -1591,9 +1638,11 @@ class TokamakSource(SourceBase):
 
     @staticmethod
     def _get_tt_energy_spectrum() -> openmc.stats.Tabular:
-        """Returns continuous Tabular spectrum for the T(t, 2n)alpha 3-body continuum."""
-        tt_energies = np.linspace(1e4, 9.5e6, 100)
-        tt_pdf = (tt_energies / 9.5e6) * (1.0 - (tt_energies / 9.5e6))**2
+        """Returns continuous Tabular spectrum for the T(t, 2n)alpha 3-body phase-space continuum."""
+        e_max = 9.443e6  # 5/6 * Q (Q = 11.332 MeV)
+        tt_energies = np.linspace(1e4, e_max, 100)
+        x = tt_energies / e_max
+        tt_pdf = np.sqrt(np.maximum(0.0, x * (1.0 - x)))
         trapz_fn = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
         tt_pdf /= trapz_fn(tt_pdf, tt_energies)
         return openmc.stats.Tabular(tt_energies, tt_pdf, interpolation='linear-linear')
@@ -1609,10 +1658,12 @@ class TokamakSource(SourceBase):
         phi_start: float = 0.0,
         phi_extent: float = 2.0 * np.pi,
         n_alpha: int = 101,
-        vertical_shift: float = 0.0,
+        vertical_shift: float | None = None,
         strength: float = 1.0,
         scale_to_cm: float | None = None,
-        constraints: dict[str, Any] | None = None
+        constraints: dict[str, Any] | None = None,
+        time_index: int | None = None,
+        time_s: float | None = None
     ) -> TokamakSource:
         """Create a deterministic TokamakSource directly from an IMAS equilibrium and core profiles.
 
@@ -1637,11 +1688,18 @@ class TokamakSource(SourceBase):
         n_alpha : int, optional
             Number of poloidal angle grid points (default: 101).
         vertical_shift : float, optional
-            Vertical shift of the plasma center in [cm] (default: 0.0).
+            Vertical shift of the plasma center in [cm]. If None (default), automatically
+            extracted from the IMAS equilibrium magnetic axis vertical position.
         strength : float, optional
             Strength of the source (default: 1.0).
+        scale_to_cm : float, optional
+            Scaling factor to convert spatial coordinates to cm (default: 100.0 if R0 < 20 m).
         constraints : dict, optional
             Constraints on sampled source particles.
+        time_index : int, optional
+            Time slice index to extract from time-dependent profiles.
+        time_s : float, optional
+            Target time in seconds to extract from time-dependent profiles (selects closest slice).
 
         Returns
         -------
@@ -1649,9 +1707,23 @@ class TokamakSource(SourceBase):
             Initialized TokamakSource with calculated emission density and
             energy distributions.
         """
-        ods = cls._load_ods(imas_input)
+        ods = cls._load_ods(imas_input, time_index=time_index, time_s=time_s)
         data = cls._extract_and_map_imas_profiles(
-            ods, n_points=n_points, scale_to_cm=scale_to_cm, reaction=reaction
+            ods,
+            n_points=n_points,
+            scale_to_cm=scale_to_cm,
+            reaction=reaction
+        )
+
+        if reaction == 'DT' and (not np.any(data['density_D'] > 0.0) or not np.any(data['density_T'] > 0.0)):
+            missing = 'Tritium' if np.any(data['density_D'] > 0.0) else 'Deuterium'
+            raise ValueError(
+                f"Cannot construct a 'DT' TokamakSource because {missing} density is zero "
+                "in core_profiles. For a pure-fuel discharge, specify reaction='DD' or 'TT'."
+            )
+
+        resolved_vertical_shift = (
+            data.get('vertical_shift', 0.0) if vertical_shift is None else float(vertical_shift)
         )
 
         return cls.from_profiles(
@@ -1670,7 +1742,7 @@ class TokamakSource(SourceBase):
             phi_start=phi_start,
             phi_extent=phi_extent,
             n_alpha=n_alpha,
-            vertical_shift=vertical_shift,
+            vertical_shift=resolved_vertical_shift,
             strength=strength,
             constraints=constraints
         )
@@ -1688,6 +1760,18 @@ class TokamakSource(SourceBase):
             return len(node) > 0
         except TypeError:
             return True
+
+    @staticmethod
+    def _get_imas_field(node: Any, key: str, default: Any = None) -> Any:
+        """Retrieve a field from an IMAS/OMAS mapping or object attribute."""
+        if hasattr(node, 'get'):
+            try:
+                if key in node:
+                    return node[key]
+            except Exception:
+                pass
+            return node.get(key, default)
+        return getattr(node, key, default)
 
     @staticmethod
     def _find_fuel_ion_densities(cp: Any, reaction: str = 'DT') -> tuple[np.ndarray, np.ndarray]:
@@ -1710,70 +1794,57 @@ class TokamakSource(SourceBase):
         ValueError
             If fuel ion densities cannot be resolved from the core profiles.
         """
+        def _fallback_from_electrons(msg: str, stacklevel: int) -> tuple[np.ndarray, np.ndarray]:
+            ne = np.asarray(cp['electrons']['density'], dtype=float)
+            warnings.warn(msg, UserWarning, stacklevel=stacklevel)
+            if reaction == 'DD':
+                return ne, np.zeros_like(ne)
+            if reaction == 'TT':
+                return np.zeros_like(ne), ne
+            return 0.5 * ne, 0.5 * ne
+
+        has_ne = 'electrons' in cp and 'density' in cp['electrons'] and len(cp['electrons']['density']) > 0
         if 'ion' not in cp or len(cp['ion']) == 0:
-            if 'electrons' in cp and 'density' in cp['electrons'] and len(cp['electrons']['density']) > 0:
-                ne = np.asarray(cp['electrons']['density'], dtype=float)
-                warnings.warn(
+            if has_ne:
+                return _fallback_from_electrons(
                     "No ion species found in core_profiles. Assuming 50:50 D-T plasma from electron density.",
-                    UserWarning,
-                    stacklevel=3
+                    stacklevel=3,
                 )
-                if reaction == 'DD':
-                    return ne, np.zeros_like(ne)
-                elif reaction == 'TT':
-                    return np.zeros_like(ne), ne
-                return 0.5 * ne, 0.5 * ne
             raise ValueError("No ion species or electron density found in core_profiles.")
 
-        # Extract ions as a list of mappings or ODS structures
-        if hasattr(cp['ion'], 'values'):
-            ions = list(cp['ion'].values())
-        elif isinstance(cp['ion'], (list, tuple)):
-            ions = list(cp['ion'])
-        else:
-            ions = [cp['ion'][i] for i in range(len(cp['ion']))]
+        ions_raw = cp['ion']
+        ions = (
+            list(ions_raw.values()) if hasattr(ions_raw, 'values')
+            else list(ions_raw) if isinstance(ions_raw, (list, tuple))
+            else [ions_raw[i] for i in range(len(ions_raw))]
+        )
 
         nD = None
         nT = None
         any_named = False
+        get_f = TokamakSource._get_imas_field
 
         for ion in ions:
-            name = ''
-            if hasattr(ion, 'get'):
-                name = str(ion.get('name', ion.get('label', ''))).strip().upper()
-            elif hasattr(ion, 'name'):
-                name = str(getattr(ion, 'name', '')).strip().upper()
-
-            dens = None
-            if hasattr(ion, 'get') and 'density' in ion:
-                dens = np.asarray(ion['density'], dtype=float)
-            elif hasattr(ion, 'density'):
-                dens = np.asarray(getattr(ion, 'density'), dtype=float)
-
-            if dens is None or dens.size == 0:
+            raw_name = get_f(ion, 'name') or get_f(ion, 'label') or ''
+            name = str(raw_name).strip().upper()
+            raw_dens = get_f(ion, 'density')
+            if raw_dens is None:
+                continue
+            dens = np.asarray(raw_dens, dtype=float)
+            if dens.size == 0:
                 continue
 
             # Check element composition (Z=1, A=2 for D; Z=1, A=3 for T)
             z_n = None
             a = None
-            elements = None
-            if hasattr(ion, 'get') and 'element' in ion:
-                elements = ion['element']
-            elif hasattr(ion, 'element'):
-                elements = getattr(ion, 'element')
-
+            elements = get_f(ion, 'element')
             if elements is not None and len(elements) > 0:
                 first_el = (
-                    elements[0] if isinstance(elements, (list, tuple))
-                    else list(elements.values())[0] if hasattr(elements, 'values')
+                    list(elements.values())[0] if hasattr(elements, 'values')
                     else elements[0]
                 )
-                if hasattr(first_el, 'get'):
-                    z_n = first_el.get('z_n')
-                    a = first_el.get('a')
-                else:
-                    z_n = getattr(first_el, 'z_n', None)
-                    a = getattr(first_el, 'a', None)
+                z_n = get_f(first_el, 'z_n')
+                a = get_f(first_el, 'a')
 
             if name or (elements is not None and len(elements) > 0):
                 any_named = True
@@ -1787,10 +1858,8 @@ class TokamakSource(SourceBase):
                 a is not None and round(float(a)) == 3
             )
 
-            # Identify Deuterium
             if name in ('D', 'DEUTERIUM', 'DEUTERON', 'D+', 'D1+') or is_d_by_comp:
                 nD = dens
-            # Identify Tritium
             elif name in ('T', 'TRITIUM', 'TRITON', 'T+', 'T1+') or is_t_by_comp:
                 nT = dens
 
@@ -1828,8 +1897,8 @@ class TokamakSource(SourceBase):
 
         # Fallback 1: Unlabelled 2-species test fixtures (backward compatibility only if NO ion is named)
         if not any_named and len(ions) >= 2 and nD is None and nT is None:
-            dens0 = ions[0].get('density') if hasattr(ions[0], 'get') else getattr(ions[0], 'density', None)
-            dens1 = ions[1].get('density') if hasattr(ions[1], 'get') else getattr(ions[1], 'density', None)
+            dens0 = get_f(ions[0], 'density')
+            dens1 = get_f(ions[1], 'density')
             if dens0 is not None and dens1 is not None and len(dens0) > 0 and len(dens1) > 0:
                 warnings.warn(
                     "Ion species in core_profiles are unlabelled. Assuming ion[0] is Deuterium and ion[1] is Tritium.",
@@ -1839,18 +1908,11 @@ class TokamakSource(SourceBase):
                 return np.asarray(dens0, dtype=float), np.asarray(dens1, dtype=float)
 
         # Fallback 2: 50:50 DT plasma assumption from electron density (only if ions were unlabelled or missing)
-        if not any_named and 'electrons' in cp and 'density' in cp['electrons'] and len(cp['electrons']['density']) > 0:
-            ne = np.asarray(cp['electrons']['density'], dtype=float)
-            warnings.warn(
+        if not any_named and has_ne:
+            return _fallback_from_electrons(
                 "No fuel ion species found in core_profiles. Assuming 50:50 D-T plasma from electron density.",
-                UserWarning,
                 stacklevel=2,
             )
-            if reaction == 'DD':
-                return ne, np.zeros_like(ne)
-            elif reaction == 'TT':
-                return np.zeros_like(ne), ne
-            return 0.5 * ne, 0.5 * ne
 
         raise ValueError(
             f"Unable to resolve Deuterium and Tritium fuel densities from core_profiles. "
@@ -1858,7 +1920,13 @@ class TokamakSource(SourceBase):
         )
 
     @classmethod
-    def _read_imas_python(cls, path: Path, ods: Any, time_index: int = 0) -> bool:
+    def _read_imas_python(
+        cls,
+        path: Path,
+        ods: Any,
+        time_index: int | None = None,
+        time_s: float | None = None
+    ) -> bool:
         """Read IMAS NetCDF-4 dataset using the official imas-python library.
 
         Parameters
@@ -1869,6 +1937,8 @@ class TokamakSource(SourceBase):
             Target OMAS Data Structure to populate.
         time_index : int, optional
             Time slice index to extract from time-dependent profiles (default: 0).
+        time_s : float, optional
+            Target time in seconds to extract from time-dependent profiles.
 
         Returns
         -------
@@ -1899,18 +1969,27 @@ class TokamakSource(SourceBase):
                         except Exception:
                             continue
 
+                        file_time_index = time_index if time_index is not None else 0
+                        if time_s is not None and time_index is None and hasattr(ids_obj, 'time'):
+                            if cls._has_imas_data(ids_obj.time):
+                                times = np.asarray(ids_obj.time)
+                                if times.size > 0:
+                                    file_time_index = int(np.argmin(np.abs(times - time_s)))
+
                         if ids_name == 'core_profiles':
                             if hasattr(ids_obj, 'profiles_1d'):
-                                if len(ids_obj.profiles_1d) <= time_index:
+                                if len(ids_obj.profiles_1d) <= file_time_index:
                                     raise IndexError(
-                                        f"Requested time_index {time_index} exceeds available profiles_1d slices "
+                                        f"Requested time_index {file_time_index} exceeds available profiles_1d slices "
                                         f"({len(ids_obj.profiles_1d)}) in '{f.name}'."
                                     )
-                                p1d = ids_obj.profiles_1d[time_index]
+                                p1d = ids_obj.profiles_1d[file_time_index]
                                 if hasattr(p1d, 'grid') and hasattr(p1d.grid, 'rho_tor_norm') and cls._has_imas_data(p1d.grid.rho_tor_norm):
                                     ods['core_profiles.profiles_1d[0].grid.rho_tor_norm'] = np.asarray(p1d.grid.rho_tor_norm)
                                 if hasattr(p1d, 'electrons') and hasattr(p1d.electrons, 'density') and cls._has_imas_data(p1d.electrons.density):
                                     ods['core_profiles.profiles_1d[0].electrons.density'] = np.asarray(p1d.electrons.density)
+                                if hasattr(p1d, 'electrons') and hasattr(p1d.electrons, 'temperature') and cls._has_imas_data(p1d.electrons.temperature):
+                                    ods['core_profiles.profiles_1d[0].electrons.temperature'] = np.asarray(p1d.electrons.temperature)
                                 if hasattr(p1d, 't_i_average') and cls._has_imas_data(p1d.t_i_average):
                                     ods['core_profiles.profiles_1d[0].t_i_average'] = np.asarray(p1d.t_i_average)
                                 if hasattr(p1d, 'ion') and len(p1d.ion) > 0:
@@ -1920,6 +1999,8 @@ class TokamakSource(SourceBase):
                                         ods[f'core_profiles.profiles_1d[0].ion[{i}].label'] = name
                                         if hasattr(ion, 'density') and cls._has_imas_data(ion.density):
                                             ods[f'core_profiles.profiles_1d[0].ion[{i}].density'] = np.asarray(ion.density)
+                                        if hasattr(ion, 'temperature') and cls._has_imas_data(ion.temperature):
+                                            ods[f'core_profiles.profiles_1d[0].ion[{i}].temperature'] = np.asarray(ion.temperature)
                                         if hasattr(ion, 'element') and len(ion.element) > 0:
                                             el = ion.element[0]
                                             if hasattr(el, 'z_n') and cls._has_imas_data(el.z_n):
@@ -1937,12 +2018,12 @@ class TokamakSource(SourceBase):
 
                         elif ids_name == 'equilibrium':
                             if hasattr(ids_obj, 'time_slice'):
-                                if len(ids_obj.time_slice) <= time_index:
+                                if len(ids_obj.time_slice) <= file_time_index:
                                     raise IndexError(
-                                        f"Requested time_index {time_index} exceeds available time_slice slices "
+                                        f"Requested time_index {file_time_index} exceeds available time_slice slices "
                                         f"({len(ids_obj.time_slice)}) in '{f.name}'."
                                     )
-                                ts = ids_obj.time_slice[time_index]
+                                ts = ids_obj.time_slice[file_time_index]
                                 p1d = getattr(ts, 'profiles_1d', None)
                                 if p1d is not None:
                                     if hasattr(p1d, 'r_outboard') and cls._has_imas_data(p1d.r_outboard):
@@ -1964,6 +2045,8 @@ class TokamakSource(SourceBase):
                                 gq = getattr(ts, 'global_quantities', None)
                                 if gq is not None and hasattr(gq, 'magnetic_axis') and hasattr(gq.magnetic_axis, 'r') and cls._has_imas_data(gq.magnetic_axis.r):
                                     ods['equilibrium.time_slice[0].global_quantities.magnetic_axis.r'] = np.asarray(gq.magnetic_axis.r)
+                                if gq is not None and hasattr(gq, 'magnetic_axis') and hasattr(gq.magnetic_axis, 'z') and cls._has_imas_data(gq.magnetic_axis.z):
+                                    ods['equilibrium.time_slice[0].global_quantities.magnetic_axis.z'] = np.asarray(gq.magnetic_axis.z)
                                 loaded_ids.add('equilibrium')
 
                         elif ids_name == 'summary':
@@ -1978,7 +2061,151 @@ class TokamakSource(SourceBase):
         return 'core_profiles' in loaded_ids and 'equilibrium' in loaded_ids
 
     @classmethod
-    def _read_imas_netcdf(cls, path: Path, ods: Any, time_index: int = 0) -> bool:
+    def _read_imas_hdf5(
+        cls,
+        path: Path,
+        ods: Any,
+        time_index: int | None = None,
+        time_s: float | None = None
+    ) -> bool:
+        """Parse native IMAS Access Layer multi-HDF5 dataset files into an OMAS Data Structure (ODS).
+
+        Parameters
+        ----------
+        path : Path
+            Path to a directory containing native IMAS HDF5 files (*.h5) or to a single IMAS HDF5 file.
+        ods : omas.ODS
+            Target OMAS Data Structure to populate in-place.
+        time_index : int, optional
+            Time slice index to extract from time-dependent profiles.
+        time_s : float, optional
+            Target time in seconds to extract from time-dependent profiles (selects closest slice).
+
+        Returns
+        -------
+        bool
+            True if native IMAS HDF5 datasets were detected and successfully ingested;
+            False otherwise.
+        """
+        files = sorted(path.glob('*.h5')) if path.is_dir() else (
+            [path] if path.suffix.lower() in ('.h5', '.hdf5') else []
+        )
+        if not files:
+            return False
+
+        target_ids = ('core_profiles', 'equilibrium', 'summary')
+        found_target = False
+        for f in files:
+            if any(f.name.startswith(t) for t in target_ids):
+                found_target = True
+                break
+        if not found_target:
+            return False
+
+        # Resolve time index independently per target IDS if time_s is provided
+        ids_time_indices: dict[str, int] = {}
+        ids_actual_times: dict[str, float] = {}
+        if time_s is not None and time_index is None:
+            for f in files:
+                try:
+                    with h5py.File(str(f), 'r') as h5f:
+                        for target_id in target_ids:
+                            if target_id in ids_time_indices:
+                                continue
+                            for time_k in (f'{target_id}/time', f'{target_id}/time_slice/time', 'time'):
+                                if time_k == 'time' and len(files) > 1 and not (f.stem.startswith(target_id) or f.name.startswith(target_id)):
+                                    continue
+                                if time_k in h5f and isinstance(h5f[time_k], h5py.Dataset):
+                                    times = np.asarray(h5f[time_k][:])
+                                    if times.size > 0:
+                                        t_idx = int(np.argmin(np.abs(times - time_s)))
+                                        ids_time_indices[target_id] = t_idx
+                                        ids_actual_times[target_id] = float(times[t_idx])
+                                        break
+                except Exception:
+                    continue
+
+        loaded_ids = set()
+        for f in files:
+            try:
+                with h5py.File(str(f), 'r') as h5f:
+                    keys = []
+                    h5f.visit(keys.append)
+                    for k in keys:
+                        if not isinstance(h5f[k], h5py.Dataset):
+                            continue
+                        if k.endswith('_SHAPE') or k.endswith('&AOS_SHAPE'):
+                            continue
+
+                        parts = k.split('/', 1)
+                        if len(parts) == 2:
+                            ids_name, subpath = parts[0], parts[1]
+                        else:
+                            ids_name = f.stem
+                            subpath = parts[0]
+
+                        if ids_name not in target_ids:
+                            continue
+
+                        resolved_time_index = (
+                            time_index if time_index is not None
+                            else ids_time_indices.get(ids_name, 0)
+                        )
+                        actual_time = ids_actual_times.get(ids_name, None)
+
+                        # Check convergence flag
+                        if ids_name == 'equilibrium' and subpath == 'code&output_flag':
+                            flag_val = h5f[k][resolved_time_index] if h5f[k].ndim > 0 else h5f[k][()]
+                            if int(flag_val) < 0:
+                                time_str = f" at t={actual_time:.3f} s" if actual_time is not None else ""
+                                warnings.warn(
+                                    f"Equilibrium time slice {resolved_time_index}{time_str} has output_flag={flag_val} (< 0), "
+                                    "indicating reconstruction may not have converged.",
+                                    UserWarning,
+                                    stacklevel=2,
+                                )
+
+                        val = h5f[k][()] if h5f[k].shape == () else h5f[k][:]
+                        if getattr(val, 'dtype', None) is not None and val.dtype.kind in ('O', 'S', 'U'):
+                            continue
+
+                        # Handle time slicing along dimension 0
+                        tokens = subpath.split('&')
+                        if 'time_slice[]' in tokens or 'profiles_1d[]' in tokens:
+                            if hasattr(val, 'ndim') and val.ndim >= 1 and val.shape[0] > resolved_time_index:
+                                val = val[resolved_time_index]
+                            elif hasattr(val, 'ndim') and val.ndim >= 1 and val.shape[0] <= resolved_time_index:
+                                raise IndexError(
+                                    f"Requested time_index {resolved_time_index} exceeds available slices "
+                                    f"({val.shape[0]}) for '{k}' in '{f.name}'."
+                                )
+                        elif subpath in ('time', 'vacuum_toroidal_field&b0'):
+                            if hasattr(val, 'ndim') and val.ndim >= 1 and val.shape[0] > resolved_time_index:
+                                val = val[resolved_time_index]
+
+                        ods_subpath = subpath.replace('[]', '.0').replace('&', '.')
+                        ods_path = f'{ids_name}.{ods_subpath}'
+                        try:
+                            ods[ods_path] = val
+                            loaded_ids.add(ids_name)
+                        except Exception:
+                            pass
+            except IndexError:
+                raise
+            except Exception as e:
+                warnings.warn(f"Failed to read native IMAS HDF5 data from '{f}': {e}", UserWarning, stacklevel=2)
+                continue
+
+        return 'core_profiles' in loaded_ids and 'equilibrium' in loaded_ids
+
+    @classmethod
+    def _read_imas_netcdf(
+        cls,
+        path: Path,
+        ods: Any,
+        time_index: int | None = None,
+        time_s: float | None = None
+    ) -> bool:
         """Parse native IMAS NetCDF-4 dataset files into an OMAS Data Structure (ODS).
 
         IMAS netCDF files (as written by IMAS-Python or the IMAS NetCDF backend) store
@@ -1997,6 +2224,8 @@ class TokamakSource(SourceBase):
             Target OMAS Data Structure to populate in-place.
         time_index : int, optional
             Time slice index to extract from time-dependent profiles (default: 0).
+        time_s : float, optional
+            Target time in seconds to extract from time-dependent profiles (selects closest slice).
 
         Returns
         -------
@@ -2018,6 +2247,25 @@ class TokamakSource(SourceBase):
         target_ids = ('core_profiles', 'equilibrium', 'summary')
         loaded_ids = set()
 
+        # Resolve time_index independently per target IDS from time_s if requested
+        ids_time_indices: dict[str, int] = {}
+        if time_s is not None and time_index is None:
+            for f in files:
+                try:
+                    with netCDF4.Dataset(str(f), 'r') as ds:
+                        for ids_name, grp in ds.groups.items():
+                            if ids_name in target_ids and ids_name not in ids_time_indices:
+                                occ_groups = grp.groups.values() if grp.groups else [grp]
+                                for occ_grp in occ_groups:
+                                    for v_name, var in occ_grp.variables.items():
+                                        if v_name in ('time', 'profiles_1d.time', 'equilibrium.time', f'{ids_name}.time'):
+                                            times = np.asarray(var[:])
+                                            if times.size > 0:
+                                                ids_time_indices[ids_name] = int(np.argmin(np.abs(times - time_s)))
+                                                break
+                except Exception:
+                    pass
+
         for f in files:
             try:
                 with netCDF4.Dataset(str(f), 'r') as ds:
@@ -2027,6 +2275,10 @@ class TokamakSource(SourceBase):
                     for ids_name, grp in ds.groups.items():
                         if ids_name not in target_ids:
                             continue
+                        resolved_time_index = (
+                            time_index if time_index is not None
+                            else ids_time_indices.get(ids_name, 0)
+                        )
                         occ_groups = grp.groups.values() if grp.groups else [grp]
                         for occ_grp in occ_groups:
                             for var_name, var in occ_grp.variables.items():
@@ -2053,13 +2305,13 @@ class TokamakSource(SourceBase):
                                         break
 
                                 if time_dim_idx is not None and arr.ndim > time_dim_idx:
-                                    if arr.shape[time_dim_idx] > time_index:
+                                    if arr.shape[time_dim_idx] > resolved_time_index:
                                         slc = [slice(None)] * arr.ndim
-                                        slc[time_dim_idx] = time_index
+                                        slc[time_dim_idx] = resolved_time_index
                                         arr = arr[tuple(slc)]
                                     else:
                                         raise IndexError(
-                                            f"Requested time_index {time_index} exceeds available "
+                                            f"Requested time_index {resolved_time_index} exceeds available "
                                             f"time slices ({arr.shape[time_dim_idx]}) for "
                                             f"variable '{var_name}' in '{f.name}'."
                                         )
@@ -2105,12 +2357,18 @@ class TokamakSource(SourceBase):
         return 'core_profiles' in loaded_ids and 'equilibrium' in loaded_ids
 
     @classmethod
-    def _load_ods(cls, imas_input: PathLike | str | Any, time_index: int = 0) -> Any:
+    def _load_ods(
+        cls,
+        imas_input: PathLike | str | Any,
+        time_index: int | None = None,
+        time_s: float | None = None
+    ) -> Any:
         """Loads an IMAS dataset from path or returns existing in-memory ODS instance.
 
         This loader prioritizes official imas-python reading for native IMAS NetCDF-4 files,
-        falls back to standalone netCDF4 group parsing if imas-python is unavailable,
-        and accommodates legacy flat OMAS formats (.nc, .h5, .hdf5) and in-memory ODS/dict.
+        supports standalone native IMAS Access Layer multi-HDF5 files, falls back to
+        standalone netCDF4 group parsing if imas-python is unavailable, and accommodates
+        legacy flat OMAS formats (.nc, .h5, .hdf5) and in-memory ODS/dict.
 
         Parameters
         ----------
@@ -2119,6 +2377,8 @@ class TokamakSource(SourceBase):
             or an existing in-memory ODS/dict object.
         time_index : int, optional
             Time slice index to extract from time-dependent profiles (default: 0).
+        time_s : float, optional
+            Target time in seconds to extract from time-dependent profiles (selects closest slice).
 
         Returns
         -------
@@ -2142,8 +2402,21 @@ class TokamakSource(SourceBase):
                 "Install it via: pip install omas"
             )
 
+        if time_index is not None and time_s is not None:
+            warnings.warn(
+                "Both 'time_index' and 'time_s' were provided; 'time_index' takes precedence.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         # 0. Pass-through in-memory representations
         if isinstance(imas_input, (ODS, dict)):
+            if time_index is not None or time_s is not None:
+                warnings.warn(
+                    "'time_index' and 'time_s' parameters are ignored when imas_input is an in-memory ODS or dict.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             return imas_input
 
         path = Path(imas_input)
@@ -2152,15 +2425,20 @@ class TokamakSource(SourceBase):
 
         # 1. Primary: Official imas-python reader
         ods_py = ODS(consistency_check=False)
-        if cls._read_imas_python(path, ods_py, time_index=time_index):
+        if cls._read_imas_python(path, ods_py, time_index=time_index, time_s=time_s):
             return ods_py
 
-        # 2. Portable Fallback: Standalone NetCDF-4 group reader (no imas-python required)
+        # 2. Native IMAS Access Layer multi-HDF5 reader
+        ods_h5 = ODS(consistency_check=False)
+        if cls._read_imas_hdf5(path, ods_h5, time_index=time_index, time_s=time_s):
+            return ods_h5
+
+        # 3. Portable Fallback: Standalone NetCDF-4 group reader (no imas-python required)
         ods_nc = ODS(consistency_check=False)
-        if cls._read_imas_netcdf(path, ods_nc, time_index=time_index):
+        if cls._read_imas_netcdf(path, ods_nc, time_index=time_index, time_s=time_s):
             return ods_nc
 
-        # 3. Legacy Fallback: Single flat OMAS files (.nc, .h5, .hdf5)
+        # 4. Legacy Fallback: Single flat OMAS files (.nc, .h5, .hdf5)
         if path.is_file():
             ext = path.suffix.lower()
             if ext == '.nc':
@@ -2186,6 +2464,13 @@ class TokamakSource(SourceBase):
 
         raise FileNotFoundError(f"No valid IMAS or OMAS datasets found in path: '{path}'")
 
+    @staticmethod
+    def _resolve_length_scale_to_cm(major_radius: float, scale_to_cm: float | None = None) -> float:
+        """Return multiplicative factor to convert length units to cm (IMAS uses m, OpenMC uses cm)."""
+        if scale_to_cm is not None:
+            return float(scale_to_cm)
+        return 100.0 if major_radius < 20.0 else 1.0
+
     @classmethod
     def _extract_and_map_imas_profiles(
         cls,
@@ -2195,16 +2480,28 @@ class TokamakSource(SourceBase):
         reaction: str = 'DT'
     ) -> dict[str, Any]:
         """Extracts 1D profiles and geometry from IMAS and maps to a uniform r_over_a grid."""
-        from scipy.interpolate import PchipInterpolator
-
         cp = ods['core_profiles']['profiles_1d'][0]
         eq = ods['equilibrium']['time_slice'][0]['profiles_1d']
         ts = ods['equilibrium']['time_slice'][0]
 
+        def _fallback_eq_grid() -> np.ndarray:
+            if 'rho_tor_norm' in eq and cls._has_imas_data(eq['rho_tor_norm']):
+                return np.asarray(eq['rho_tor_norm'], dtype=float)
+            if 'psi_norm' in eq and cls._has_imas_data(eq['psi_norm']):
+                return np.sqrt(np.clip(np.asarray(eq['psi_norm'], dtype=float), 0.0, 1.0))
+            n_eq_geom = (
+                len(eq['elongation']) if ('elongation' in eq and cls._has_imas_data(eq['elongation']))
+                else len(eq['triangularity']) if ('triangularity' in eq and cls._has_imas_data(eq['triangularity']))
+                else n_points
+            )
+            return np.linspace(0.0, 1.0, n_eq_geom)
+
         # 1. 1D boundary radii and geometric mapping r_tilde(rho)
+        r_in = None
+        r_out = None
         if (
             'r_inboard' in eq and 'r_outboard' in eq
-            and len(eq['r_inboard']) > 0 and len(eq['r_outboard']) > 0
+            and cls._has_imas_data(eq['r_inboard']) and cls._has_imas_data(eq['r_outboard'])
         ):
             r_in = np.asarray(eq['r_inboard'], dtype=float)
             r_out = np.asarray(eq['r_outboard'], dtype=float)
@@ -2216,34 +2513,299 @@ class TokamakSource(SourceBase):
                 )
             r_tilde_eq = r_geom / a_minor
             R0 = float(0.5 * (r_out[-1] + r_in[-1]))
-        else:
+        elif (
+            'profiles_2d' in ts and len(ts['profiles_2d']) > 0
+            and 'grid' in ts['profiles_2d'][0] and 'psi' in ts['profiles_2d'][0]
+            and 'dim1' in ts['profiles_2d'][0]['grid'] and 'dim2' in ts['profiles_2d'][0]['grid']
+            and cls._has_imas_data(ts['profiles_2d'][0]['grid']['dim1'])
+            and cls._has_imas_data(ts['profiles_2d'][0]['grid']['dim2'])
+            and cls._has_imas_data(ts['profiles_2d'][0]['psi'])
+            and 'global_quantities' in ts and 'magnetic_axis' in ts['global_quantities']
+            and 'r' in ts['global_quantities']['magnetic_axis']
+            and 'z' in ts['global_quantities']['magnetic_axis']
+            and cls._has_imas_data(ts['global_quantities']['magnetic_axis']['r'])
+            and cls._has_imas_data(ts['global_quantities']['magnetic_axis']['z'])
+            and 'psi_magnetic_axis' in ts['global_quantities']
+            and cls._has_imas_data(ts['global_quantities']['psi_magnetic_axis'])
+            and 'boundary' in ts and 'psi' in ts['boundary']
+            and cls._has_imas_data(ts['boundary']['psi'])
+        ):
+            r_grid = np.squeeze(np.asarray(ts['profiles_2d'][0]['grid']['dim1'], dtype=float))
+            z_grid = np.squeeze(np.asarray(ts['profiles_2d'][0]['grid']['dim2'], dtype=float))
+            psi_2d = np.squeeze(np.asarray(ts['profiles_2d'][0]['psi'], dtype=float))
+
+            mag_r = float(np.asarray(ts['global_quantities']['magnetic_axis']['r']).flat[0])
+            mag_z = float(np.asarray(ts['global_quantities']['magnetic_axis']['z']).flat[0])
+            psi_axis = float(np.asarray(ts['global_quantities']['psi_magnetic_axis']).flat[0])
+            psi_bnd = float(np.asarray(ts['boundary']['psi']).flat[0])
+
+            # Determine grid orientation (dim1=R, dim2=Z vs dim1=Z, dim2=R)
+            if psi_2d.shape == (len(r_grid), len(z_grid)) and len(r_grid) != len(z_grid):
+                interp = RegularGridInterpolator((r_grid, z_grid), psi_2d, method='linear', bounds_error=False, fill_value=None)
+                fine_r = np.linspace(r_grid[0], r_grid[-1], 1000)
+                pts = np.column_stack([fine_r, np.full_like(fine_r, mag_z)])
+            elif psi_2d.shape == (len(z_grid), len(r_grid)) and len(r_grid) != len(z_grid):
+                interp = RegularGridInterpolator((z_grid, r_grid), psi_2d, method='linear', bounds_error=False, fill_value=None)
+                fine_r = np.linspace(r_grid[0], r_grid[-1], 1000)
+                pts = np.column_stack([np.full_like(fine_r, mag_z), fine_r])
+            elif psi_2d.shape == (len(r_grid), len(z_grid)) and len(r_grid) == len(z_grid):
+                # Square grid: determine whether orientation is (R, Z) or (Z, R)
+                # by evaluating psi at off-axis points (boundary outline or midplane points)
+                interp_rz = RegularGridInterpolator((r_grid, z_grid), psi_2d, method='linear', bounds_error=False, fill_value=np.nan)
+                interp_zr = RegularGridInterpolator((z_grid, r_grid), psi_2d, method='linear', bounds_error=False, fill_value=np.nan)
+
+                test_pts_rz = []
+                if (
+                    'boundary' in ts and 'outline' in ts['boundary']
+                    and 'r' in ts['boundary']['outline'] and 'z' in ts['boundary']['outline']
+                    and cls._has_imas_data(ts['boundary']['outline']['r'])
+                    and cls._has_imas_data(ts['boundary']['outline']['z'])
+                ):
+                    r_outl = np.asarray(ts['boundary']['outline']['r'], dtype=float)
+                    z_outl = np.asarray(ts['boundary']['outline']['z'], dtype=float)
+                    step = max(1, len(r_outl) // 8)
+                    for ro, zo in zip(r_outl[::step], z_outl[::step]):
+                        test_pts_rz.append((float(ro), float(zo), 1.0))
+
+                a_cand = (
+                    float(np.asarray(ts['boundary']['minor_radius']).flat[0])
+                    if ('boundary' in ts and 'minor_radius' in ts['boundary'] and cls._has_imas_data(ts['boundary']['minor_radius']))
+                    else 0.25 * (r_grid[-1] - r_grid[0])
+                )
+                r_mid = (
+                    float(np.asarray(ts['boundary']['geometric_axis']['r']).flat[0])
+                    if ('boundary' in ts and 'geometric_axis' in ts['boundary'] and 'r' in ts['boundary']['geometric_axis'] and cls._has_imas_data(ts['boundary']['geometric_axis']['r']))
+                    else mag_r
+                )
+                test_pts_rz.append((r_mid + a_cand, mag_z, 1.0))
+                test_pts_rz.append((r_mid - a_cand, mag_z, 1.0))
+                test_pts_rz.append((r_mid + 0.5 * a_cand, mag_z, 0.25))
+                test_pts_rz.append((r_mid - 0.5 * a_cand, mag_z, 0.25))
+
+                err_rz_list = []
+                err_zr_list = []
+                denom = (psi_bnd - psi_axis) if psi_bnd != psi_axis else 1.0
+                for r_pt, z_pt, target_psin in test_pts_rz:
+                    v_rz = float(interp_rz([[r_pt, z_pt]])[0])
+                    v_zr = float(interp_zr([[z_pt, r_pt]])[0])
+                    if not np.isnan(v_rz):
+                        psin_rz = (v_rz - psi_axis) / denom if psi_bnd != psi_axis else v_rz
+                        err_rz_list.append(abs(psin_rz - target_psin))
+                    else:
+                        err_rz_list.append(100.0)
+
+                    if not np.isnan(v_zr):
+                        psin_zr = (v_zr - psi_axis) / denom if psi_bnd != psi_axis else v_zr
+                        err_zr_list.append(abs(psin_zr - target_psin))
+                    else:
+                        err_zr_list.append(100.0)
+
+                fine_r = np.linspace(r_grid[0], r_grid[-1], 1000)
+                if np.mean(err_rz_list) <= np.mean(err_zr_list):
+                    interp = interp_rz
+                    pts = np.column_stack([fine_r, np.full_like(fine_r, mag_z)])
+                else:
+                    interp = interp_zr
+                    pts = np.column_stack([np.full_like(fine_r, mag_z), fine_r])
+            else:
+                raise ValueError(
+                    f"2D equilibrium grid shape mismatch: psi_2d {psi_2d.shape} does not match "
+                    f"grid dimensions (dim1={len(r_grid)}, dim2={len(z_grid)})."
+                )
+
+            psi_mid_n = (interp(pts) - psi_axis) / (psi_bnd - psi_axis)
+
+            # Extract monotonic branches radiating outward from magnetic axis mag_r
+            outboard_mask = (fine_r >= mag_r)
+            r_out_cand = fine_r[outboard_mask]
+            psi_out_cand = psi_mid_n[outboard_mask]
+
+            inboard_mask = (fine_r <= mag_r)
+            r_in_cand = fine_r[inboard_mask][::-1]  # starts at mag_r, decreasing R
+            psi_in_cand = psi_mid_n[inboard_mask][::-1]
+
+            # Build strictly increasing monotonic branch from axis for outboard
+            valid_out = [0]
+            for i in range(1, len(r_out_cand)):
+                if psi_out_cand[i] > psi_out_cand[valid_out[-1]]:
+                    valid_out.append(i)
+                    if psi_out_cand[i] >= 1.05:
+                        break
+                elif psi_out_cand[valid_out[-1]] >= 1.0:
+                    break
+            r_out_clean = r_out_cand[valid_out]
+            psi_out_clean = psi_out_cand[valid_out]
+            psi_out_clean[0] = 0.0
+            r_out_clean[0] = mag_r
+
+            # Build strictly increasing monotonic branch from axis for inboard
+            valid_in = [0]
+            for i in range(1, len(r_in_cand)):
+                if psi_in_cand[i] > psi_in_cand[valid_in[-1]]:
+                    valid_in.append(i)
+                    if psi_in_cand[i] >= 1.05:
+                        break
+                elif psi_in_cand[valid_in[-1]] >= 1.0:
+                    break
+            r_in_clean = r_in_cand[valid_in]
+            psi_in_clean = psi_in_cand[valid_in]
+            psi_in_clean[0] = 0.0
+            r_in_clean[0] = mag_r
+
+            # Ensure branches cover up to normalized flux 1.0
+            if psi_out_clean[-1] < 1.0 and len(psi_out_clean) >= 2:
+                slope = (r_out_clean[-1] - r_out_clean[-2]) / (psi_out_clean[-1] - psi_out_clean[-2])
+                r_out_clean = np.append(r_out_clean, r_out_clean[-1] + slope * (1.0 - psi_out_clean[-1]))
+                psi_out_clean = np.append(psi_out_clean, 1.0)
+            if psi_in_clean[-1] < 1.0 and len(psi_in_clean) >= 2:
+                slope = (r_in_clean[-1] - r_in_clean[-2]) / (psi_in_clean[-1] - psi_in_clean[-2])
+                r_in_clean = np.append(r_in_clean, r_in_clean[-1] + slope * (1.0 - psi_in_clean[-1]))
+                psi_in_clean = np.append(psi_in_clean, 1.0)
+
+            if 'psi_norm' in eq and cls._has_imas_data(eq['psi_norm']):
+                psi_n_1d = np.asarray(eq['psi_norm'], dtype=float)
+            elif 'psi' in eq and cls._has_imas_data(eq['psi']):
+                psi_n_1d = (np.asarray(eq['psi'], dtype=float) - psi_axis) / (psi_bnd - psi_axis)
+            elif 'rho_tor_norm' in eq and cls._has_imas_data(eq['rho_tor_norm']):
+                psi_n_1d = (np.asarray(eq['rho_tor_norm'], dtype=float)) ** 2
+            else:
+                psi_n_1d = np.linspace(0.0, 1.0, n_points)
+
+            psi_n_1d = np.clip(psi_n_1d, 0.0, 1.0)
+            r_in = np.interp(psi_n_1d, psi_in_clean, r_in_clean)
+            r_out = np.interp(psi_n_1d, psi_out_clean, r_out_clean)
+            r_geom = 0.5 * (r_out - r_in)
+            r_geom[0] = 0.0
+
+            if (
+                'boundary' in ts and 'minor_radius' in ts['boundary']
+                and cls._has_imas_data(ts['boundary']['minor_radius'])
+            ):
+                a_minor = float(np.asarray(ts['boundary']['minor_radius']).flat[0])
+            else:
+                a_minor = float(r_geom[-1])
+
+            if a_minor <= 0.0:
+                raise ValueError(
+                    f"Invalid minor radius calculated from 2D equilibrium: a = {a_minor} <= 0."
+                )
+
+            r_tilde_eq = np.clip(r_geom / a_minor, 0.0, 1.0)
+            r_tilde_eq[0] = 0.0
+            r_tilde_eq[-1] = 1.0
+            for i in range(1, len(r_tilde_eq)):
+                if r_tilde_eq[i] <= r_tilde_eq[i - 1]:
+                    r_tilde_eq[i] = r_tilde_eq[i - 1] + 1e-7
+            r_tilde_eq[-1] = max(r_tilde_eq[-1], 1.0)
+
+            if (
+                'boundary' in ts and 'geometric_axis' in ts['boundary']
+                and 'r' in ts['boundary']['geometric_axis']
+                and cls._has_imas_data(ts['boundary']['geometric_axis']['r'])
+            ):
+                R0 = float(np.asarray(ts['boundary']['geometric_axis']['r']).flat[0])
+            elif (
+                'boundary' in ts and 'outline' in ts['boundary']
+                and 'r' in ts['boundary']['outline']
+                and cls._has_imas_data(ts['boundary']['outline']['r'])
+            ):
+                outline_r = np.asarray(ts['boundary']['outline']['r'], dtype=float)
+                R0 = float(0.5 * (outline_r.max() + outline_r.min()))
+            else:
+                R0 = float(0.5 * (r_out[-1] + r_in[-1]))
+        elif (
+            'boundary' in ts and 'minor_radius' in ts['boundary']
+            and cls._has_imas_data(ts['boundary']['minor_radius'])
+        ):
+            a_minor = float(np.asarray(ts['boundary']['minor_radius']).flat[0])
+            if a_minor <= 0.0:
+                raise ValueError(
+                    f"Invalid minor radius found in equilibrium boundary: a = {a_minor} <= 0."
+                )
+
+            # Resolve major radius R0 from geometric axis, outline, or magnetic axis
+            if (
+                'geometric_axis' in ts['boundary'] and 'r' in ts['boundary']['geometric_axis']
+                and cls._has_imas_data(ts['boundary']['geometric_axis']['r'])
+            ):
+                R0 = float(np.asarray(ts['boundary']['geometric_axis']['r']).flat[0])
+            elif (
+                'outline' in ts['boundary'] and 'r' in ts['boundary']['outline']
+                and cls._has_imas_data(ts['boundary']['outline']['r'])
+            ):
+                outline_r = np.asarray(ts['boundary']['outline']['r'], dtype=float)
+                R0 = float(0.5 * (outline_r.max() + outline_r.min()))
+            elif (
+                'global_quantities' in ts and 'magnetic_axis' in ts['global_quantities']
+                and 'r' in ts['global_quantities']['magnetic_axis']
+                and cls._has_imas_data(ts['global_quantities']['magnetic_axis']['r'])
+            ):
+                R0 = float(np.asarray(ts['global_quantities']['magnetic_axis']['r']).flat[0])
+            else:
+                raise ValueError(
+                    "Unable to resolve major radius R0 from equilibrium boundary data."
+                )
+
             warnings.warn(
-                "No 'r_inboard' and 'r_outboard' found in equilibrium. "
-                "Defaulting to major_radius=3.3m, minor_radius=1.13m.",
+                f"No 1D 'r_inboard' and 'r_outboard' profiles found in equilibrium. "
+                f"Using boundary scalar dimensions: major_radius R0={R0:.3f} m, minor_radius a={a_minor:.3f} m.",
                 UserWarning,
                 stacklevel=2,
             )
-            R0 = 3.3
-            a_minor = 1.13
-            n_eq_geom = (
-                len(eq['elongation']) if ('elongation' in eq and len(eq['elongation']) > 0)
-                else len(eq['triangularity']) if ('triangularity' in eq and len(eq['triangularity']) > 0)
-                else n_points
+            r_tilde_eq = _fallback_eq_grid()
+        elif (
+            'boundary' in ts and 'outline' in ts['boundary'] and 'r' in ts['boundary']['outline']
+            and cls._has_imas_data(ts['boundary']['outline']['r'])
+        ):
+            outline_r = np.asarray(ts['boundary']['outline']['r'], dtype=float)
+            R0 = float(0.5 * (outline_r.max() + outline_r.min()))
+            a_minor = float(0.5 * (outline_r.max() - outline_r.min()))
+            if a_minor <= 0.0:
+                raise ValueError(
+                    f"Invalid minor radius calculated from boundary outline: a = {a_minor} <= 0."
+                )
+            warnings.warn(
+                f"No 1D 'r_inboard'/'r_outboard' or 'boundary.minor_radius' found in equilibrium. "
+                f"Derived dimensions from boundary outline: major_radius R0={R0:.3f} m, minor_radius a={a_minor:.3f} m.",
+                UserWarning,
+                stacklevel=2,
             )
-            r_tilde_eq = np.linspace(0.0, 1.0, n_eq_geom)
+            r_tilde_eq = _fallback_eq_grid()
+        else:
+            raise ValueError(
+                "Unable to determine plasma dimensions (major_radius R0 and minor_radius a) from equilibrium. "
+                "Neither 1D radial profiles ('r_inboard', 'r_outboard') nor boundary scalar metrics "
+                "('boundary.minor_radius', 'boundary.geometric_axis.r', 'boundary.outline.r') were found."
+            )
 
-        # Convert to cm for OpenMC (IMAS stores meters)
-        # Note: If IMAS is in meters, multiply by 100 to get cm for OpenMC
-        # If already in cm (R0 > 20), keep as-is
-        if scale_to_cm is None:
-            scale_to_cm = 100.0 if R0 < 20.0 else 1.0
+        scale_to_cm = cls._resolve_length_scale_to_cm(R0, scale_to_cm)
         major_radius_cm = R0 * scale_to_cm
         minor_radius_cm = a_minor * scale_to_cm
 
         r_over_a = np.linspace(0.0, 1.0, n_points)
 
         # 2. Resample Mean Profiles using PCHIP
-        T_mean_raw = np.asarray(cp['t_i_average'], dtype=float)
+        if 't_i_average' in cp and cls._has_imas_data(cp['t_i_average']):
+            T_mean_raw = np.asarray(cp['t_i_average'], dtype=float)
+        elif 'ion' in cp and any(cls._has_imas_data(cls._get_imas_field(ion, 'temperature')) for ion in (cp['ion'].values() if hasattr(cp['ion'], 'values') else cp['ion'])):
+            ions_list = list(cp['ion'].values()) if hasattr(cp['ion'], 'values') else list(cp['ion'])
+            t_ion = next(np.asarray(cls._get_imas_field(ion, 'temperature'), dtype=float) for ion in ions_list if cls._has_imas_data(cls._get_imas_field(ion, 'temperature')))
+            warnings.warn("No 't_i_average' found in core_profiles; using species ion temperature from 'ion[].temperature'.", UserWarning, stacklevel=2)
+            T_mean_raw = t_ion
+        elif 'electrons' in cp and 'temperature' in cp['electrons'] and cls._has_imas_data(cp['electrons']['temperature']):
+            warnings.warn(
+                "No ion temperature ('t_i_average' or 'ion[].temperature') found in core_profiles. "
+                "Assuming thermal equilibrium T_i = T_e from electron temperature.",
+                UserWarning,
+                stacklevel=2
+            )
+            T_mean_raw = np.asarray(cp['electrons']['temperature'], dtype=float)
+        else:
+            raise ValueError(
+                "Unable to resolve plasma temperature from core_profiles. "
+                "Neither 't_i_average', 'ion[].temperature', nor 'electrons.temperature' was found."
+            )
+
         nD_mean_raw, nT_mean_raw = cls._find_fuel_ion_densities(cp, reaction=reaction)
         ne_mean_raw = (
             np.asarray(cp['electrons']['density'], dtype=float)
@@ -2314,21 +2876,31 @@ class TokamakSource(SourceBase):
             r_tilde_cp[0] = 0.0
             r_tilde_cp[-1] = 1.0
 
-        temperature = np.maximum(0.0, PchipInterpolator(r_tilde_cp, T_mean_raw)(r_over_a))
-        density_D = np.maximum(0.0, PchipInterpolator(r_tilde_cp, nD_mean_raw)(r_over_a))
-        density_T = np.maximum(0.0, PchipInterpolator(r_tilde_cp, nT_mean_raw)(r_over_a))
+        for i in range(1, len(r_tilde_cp)):
+            if r_tilde_cp[i] <= r_tilde_cp[i - 1]:
+                r_tilde_cp[i] = r_tilde_cp[i - 1] + 1e-7
+
+        r_eval_cp = np.clip(r_over_a, r_tilde_cp[0], r_tilde_cp[-1])
+        temperature = np.maximum(0.0, PchipInterpolator(r_tilde_cp, T_mean_raw)(r_eval_cp))
+        density_D = np.maximum(0.0, PchipInterpolator(r_tilde_cp, nD_mean_raw)(r_eval_cp))
+        density_T = np.maximum(0.0, PchipInterpolator(r_tilde_cp, nT_mean_raw)(r_eval_cp))
 
         # 3. Geometry Profiles
-        kappa_raw = (
-            np.asarray(eq['elongation'], dtype=float)
-            if 'elongation' in eq and len(eq['elongation']) > 0
-            else np.full_like(r_tilde_eq, 1.0)
-        )
-        elongation = np.maximum(1.0, PchipInterpolator(r_tilde_eq, kappa_raw)(r_over_a))
+        if 'elongation' in eq and cls._has_imas_data(eq['elongation']):
+            kappa_raw = np.asarray(eq['elongation'], dtype=float)
+            if len(kappa_raw) == 1:
+                elongation = 1.0 + (float(kappa_raw[0]) - 1.0) * (r_over_a ** 2)
+            else:
+                elongation = np.maximum(1.0, PchipInterpolator(r_tilde_eq, kappa_raw)(r_over_a))
+        elif 'boundary' in ts and 'elongation' in ts['boundary'] and cls._has_imas_data(ts['boundary']['elongation']):
+            kappa_edge = float(np.asarray(ts['boundary']['elongation']).flat[0])
+            elongation = 1.0 + (kappa_edge - 1.0) * (r_over_a ** 2)
+        else:
+            elongation = np.ones_like(r_over_a)
 
         if (
             'triangularity_upper' in eq and 'triangularity_lower' in eq
-            and len(eq['triangularity_upper']) > 0 and len(eq['triangularity_lower']) > 0
+            and cls._has_imas_data(eq['triangularity_upper']) and cls._has_imas_data(eq['triangularity_lower'])
         ):
             delta_u = np.asarray(eq['triangularity_upper'], dtype=float)
             delta_l = np.asarray(eq['triangularity_lower'], dtype=float)
@@ -2340,24 +2912,58 @@ class TokamakSource(SourceBase):
                     stacklevel=2,
                 )
             delta_raw = 0.5 * (delta_u + delta_l)
-        elif 'triangularity' in eq and len(eq['triangularity']) > 0:
+            if len(delta_raw) == 1:
+                triangularity = float(delta_raw[0]) * r_over_a
+            else:
+                triangularity = PchipInterpolator(r_tilde_eq, delta_raw)(r_over_a)
+        elif 'triangularity' in eq and cls._has_imas_data(eq['triangularity']):
             delta_raw = np.asarray(eq['triangularity'], dtype=float)
+            if len(delta_raw) == 1:
+                triangularity = float(delta_raw[0]) * r_over_a
+            else:
+                triangularity = PchipInterpolator(r_tilde_eq, delta_raw)(r_over_a)
+        elif 'boundary' in ts and 'triangularity' in ts['boundary'] and cls._has_imas_data(ts['boundary']['triangularity']):
+            delta_edge = float(np.asarray(ts['boundary']['triangularity']).flat[0])
+            triangularity = delta_edge * r_over_a
+        elif (
+            'boundary' in ts and 'triangularity_upper' in ts['boundary'] and 'triangularity_lower' in ts['boundary']
+            and cls._has_imas_data(ts['boundary']['triangularity_upper']) and cls._has_imas_data(ts['boundary']['triangularity_lower'])
+        ):
+            delta_u = float(np.asarray(ts['boundary']['triangularity_upper']).flat[0])
+            delta_l = float(np.asarray(ts['boundary']['triangularity_lower']).flat[0])
+            triangularity = 0.5 * (delta_u + delta_l) * r_over_a
         else:
-            delta_raw = np.zeros_like(r_tilde_eq)
+            triangularity = np.zeros_like(r_over_a)
 
-        triangularity = PchipInterpolator(r_tilde_eq, delta_raw)(r_over_a)
         triangularity[0] = 0.0  # Triangularity vanishes at the core axis
 
-        # 4. Shafranov shift: displacement of magnetic/geometric axis from boundary center R0
-        if 'global_quantities.magnetic_axis.r' in ts and np.asarray(ts['global_quantities.magnetic_axis.r']).size > 0:
-            R_axis = float(np.asarray(ts['global_quantities.magnetic_axis.r']).flat[0])
-            shafranov_shift = float(R_axis - R0) * scale_to_cm
-        elif 'geometric_axis.r' in eq and np.asarray(eq['geometric_axis.r']).size > 0:
-            R_axis = float(np.asarray(eq['geometric_axis.r']).flat[0])
-            shafranov_shift = float(R_axis - R0) * scale_to_cm
-        else:
-            shafranov_shift = 0.0
-        shafranov_shift = max(0.0, shafranov_shift)
+        # 4. Shafranov and vertical shifts from magnetic/geometric axis
+        def _resolve_axis_coord(coord: str, check_boundary_geom: bool = False) -> float | None:
+            if (
+                'global_quantities' in ts and 'magnetic_axis' in ts['global_quantities']
+                and coord in ts['global_quantities']['magnetic_axis']
+                and cls._has_imas_data(ts['global_quantities']['magnetic_axis'][coord])
+            ):
+                return float(np.asarray(ts['global_quantities']['magnetic_axis'][coord]).flat[0])
+            flat_mag = f'global_quantities.magnetic_axis.{coord}'
+            if flat_mag in ts and np.asarray(ts[flat_mag]).size > 0:
+                return float(np.asarray(ts[flat_mag]).flat[0])
+            if (
+                check_boundary_geom and 'boundary' in ts and 'geometric_axis' in ts['boundary']
+                and coord in ts['boundary']['geometric_axis']
+                and cls._has_imas_data(ts['boundary']['geometric_axis'][coord])
+            ):
+                return float(np.asarray(ts['boundary']['geometric_axis'][coord]).flat[0])
+            flat_geom = f'geometric_axis.{coord}'
+            if flat_geom in eq and np.asarray(eq[flat_geom]).size > 0:
+                return float(np.asarray(eq[flat_geom]).flat[0])
+            return None
+
+        R_axis = _resolve_axis_coord('r', check_boundary_geom=False)
+        shafranov_shift = max(0.0, float(R_axis - R0) * scale_to_cm) if R_axis is not None else 0.0
+
+        z_axis = _resolve_axis_coord('z', check_boundary_geom=True)
+        vertical_shift_detected = float(z_axis * scale_to_cm) if z_axis is not None else 0.0
 
         return {
             'r_over_a': r_over_a,
@@ -2370,12 +2976,15 @@ class TokamakSource(SourceBase):
             'elongation': elongation,
             'triangularity': triangularity,
             'shafranov_shift': shafranov_shift,
+            'vertical_shift': vertical_shift_detected,
             'R0': R0,
             'a_minor': a_minor,
             'T_mean_raw': T_mean_raw,
             'nD_mean_raw': nD_mean_raw,
             'nT_mean_raw': nT_mean_raw,
             'ne_mean_raw': ne_mean_raw,
+            'r_inboard': r_in * scale_to_cm if r_in is not None else None,
+            'r_outboard': r_out * scale_to_cm if r_out is not None else None,
         }
 
 class TokamakSourceEnsemble:
@@ -2584,89 +3193,54 @@ class TokamakSourceEnsemble:
         self.vertical_shift = vertical_shift
         self.constraints = constraints
 
-        # 1. Compute or assign emission density profiles for DT, DD, TT
-        if emission_density_DT is None:
-            self.emission_density_DT = np.zeros((n_samples, n_points), dtype=float)
-            for i in range(n_samples):
-                self.emission_density_DT[i] = TokamakSource._calculate_fusion_emissivity(
-                    self.density_D[i], self.density_T[i], self.temperature[i], reaction='DT'
-                )
-        else:
-            self.emission_density_DT = np.asarray(emission_density_DT, dtype=float)
-
-        if emission_density_DD is None:
-            self.emission_density_DD = np.zeros((n_samples, n_points), dtype=float)
-            for i in range(n_samples):
-                self.emission_density_DD[i] = TokamakSource._calculate_fusion_emissivity(
-                    self.density_D[i], self.density_T[i], self.temperature[i], reaction='DD'
-                )
-        else:
-            self.emission_density_DD = np.asarray(emission_density_DD, dtype=float)
-
-        if emission_density_TT is None:
-            self.emission_density_TT = np.zeros((n_samples, n_points), dtype=float)
-            for i in range(n_samples):
-                self.emission_density_TT[i] = TokamakSource._calculate_fusion_emissivity(
-                    self.density_D[i], self.density_T[i], self.temperature[i], reaction='TT'
-                )
-        else:
-            self.emission_density_TT = np.asarray(emission_density_TT, dtype=float)
+        # 1. Compute or assign emission density profiles for DT, DD, TT (vectorized over realizations)
+        self.emission_density_DT = (
+            TokamakSource._calculate_fusion_emissivity(
+                self.density_D, self.density_T, self.temperature, reaction='DT'
+            ) if emission_density_DT is None else np.asarray(emission_density_DT, dtype=float)
+        )
+        self.emission_density_DD = (
+            TokamakSource._calculate_fusion_emissivity(
+                self.density_D, self.density_T, self.temperature, reaction='DD'
+            ) if emission_density_DD is None else np.asarray(emission_density_DD, dtype=float)
+        )
+        self.emission_density_TT = (
+            TokamakSource._calculate_fusion_emissivity(
+                self.density_D, self.density_T, self.temperature, reaction='TT'
+            ) if emission_density_TT is None else np.asarray(emission_density_TT, dtype=float)
+        )
 
         # Combined total emissivity profile
         self.emission_density = self.emission_density_DT + self.emission_density_DD + self.emission_density_TT
 
         # 2. Compute or assign radial energy distributions for DT, DD, TT
-        if energy_DT is None:
-            self.energy_DT = [
-                TokamakSource._ballabio_energy_spectrum(self.temperature[i], reaction='DT')
-                for i in range(n_samples)
-            ]
-        else:
-            self.energy_DT = list(energy_DT)
+        self.energy_DT = (
+            [TokamakSource._ballabio_energy_spectrum(self.temperature[i], reaction='DT') for i in range(n_samples)]
+            if energy_DT is None else list(energy_DT)
+        )
+        self.energy_DD = (
+            [TokamakSource._ballabio_energy_spectrum(self.temperature[i], reaction='DD') for i in range(n_samples)]
+            if energy_DD is None else list(energy_DD)
+        )
+        self.energy_TT = TokamakSource._get_tt_energy_spectrum() if energy_TT is None else energy_TT
 
-        if energy_DD is None:
-            self.energy_DD = [
-                TokamakSource._ballabio_energy_spectrum(self.temperature[i], reaction='DD')
-                for i in range(n_samples)
-            ]
-        else:
-            self.energy_DD = list(energy_DD)
-
-        if energy_TT is None:
-            self.energy_TT = TokamakSource._get_tt_energy_spectrum()
-        else:
-            self.energy_TT = energy_TT
-
-        # 3. Compute or assign integrated source strengths in [neutrons / s]
-        if strength_DT is None:
-            self.strength_DT = np.array([
-                self._calculate_integrated_source_strength(
-                    self.emission_density_DT[i], self.r_over_a, self.major_radius,
-                    self.minor_radius, self.elongation, self.triangularity, self.shafranov_shift
-                ) for i in range(n_samples)
-            ], dtype=float)
-        else:
-            self.strength_DT = np.asarray(strength_DT, dtype=float)
-
-        if strength_DD is None:
-            self.strength_DD = np.array([
-                self._calculate_integrated_source_strength(
-                    self.emission_density_DD[i], self.r_over_a, self.major_radius,
-                    self.minor_radius, self.elongation, self.triangularity, self.shafranov_shift
-                ) for i in range(n_samples)
-            ], dtype=float)
-        else:
-            self.strength_DD = np.asarray(strength_DD, dtype=float)
-
-        if strength_TT is None:
-            self.strength_TT = np.array([
-                self._calculate_integrated_source_strength(
-                    self.emission_density_TT[i], self.r_over_a, self.major_radius,
-                    self.minor_radius, self.elongation, self.triangularity, self.shafranov_shift
-                ) for i in range(n_samples)
-            ], dtype=float)
-        else:
-            self.strength_TT = np.asarray(strength_TT, dtype=float)
+        # 3. Compute or assign integrated source strengths in [neutrons / s] (vectorized over realizations)
+        geom_args = (
+            self.r_over_a, self.major_radius, self.minor_radius,
+            self.elongation, self.triangularity, self.shafranov_shift
+        )
+        self.strength_DT = (
+            self._calculate_integrated_source_strength(self.emission_density_DT, *geom_args)
+            if strength_DT is None else np.asarray(strength_DT, dtype=float)
+        )
+        self.strength_DD = (
+            self._calculate_integrated_source_strength(self.emission_density_DD, *geom_args)
+            if strength_DD is None else np.asarray(strength_DD, dtype=float)
+        )
+        self.strength_TT = (
+            self._calculate_integrated_source_strength(self.emission_density_TT, *geom_args)
+            if strength_TT is None else np.asarray(strength_TT, dtype=float)
+        )
 
         # Total integrated source strength
         self._strengths = self.strength_DT + self.strength_DD + self.strength_TT
@@ -2743,71 +3317,32 @@ class TokamakSourceEnsemble:
         tot = self._strengths[index] if normalize_strength and self._strengths[index] > 0 else 1.0
         sources = []
 
-        if self.strength_DT[index] > 0.0 and np.any(self.emission_density_DT[index] > 0.0):
-            s_DT = float(self.strength_DT[index] / tot) if normalize_strength else float(self.strength_DT[index])
-            src_DT = TokamakSource(
-                major_radius=self.major_radius,
-                minor_radius=self.minor_radius,
-                elongation=self.elongation,
-                triangularity=self.triangularity,
-                shafranov_shift=self.shafranov_shift,
-                r_over_a=self.r_over_a,
-                emission_density=self.emission_density_DT[index],
-                energy=self.energy_DT[index],
-                method=self.method,
-                time=self.time,
-                phi_start=self.phi_start,
-                phi_extent=self.phi_extent,
-                n_alpha=self.n_alpha,
-                vertical_shift=self.vertical_shift,
-                strength=s_DT,
-                constraints=self.constraints
-            )
-            sources.append(src_DT)
-
-        if self.strength_DD[index] > 0.0 and np.any(self.emission_density_DD[index] > 0.0):
-            s_DD = float(self.strength_DD[index] / tot) if normalize_strength else float(self.strength_DD[index])
-            src_DD = TokamakSource(
-                major_radius=self.major_radius,
-                minor_radius=self.minor_radius,
-                elongation=self.elongation,
-                triangularity=self.triangularity,
-                shafranov_shift=self.shafranov_shift,
-                r_over_a=self.r_over_a,
-                emission_density=self.emission_density_DD[index],
-                energy=self.energy_DD[index],
-                method=self.method,
-                time=self.time,
-                phi_start=self.phi_start,
-                phi_extent=self.phi_extent,
-                n_alpha=self.n_alpha,
-                vertical_shift=self.vertical_shift,
-                strength=s_DD,
-                constraints=self.constraints
-            )
-            sources.append(src_DD)
-
-        if self.strength_TT[index] > 0.0 and np.any(self.emission_density_TT[index] > 0.0):
-            s_TT = float(self.strength_TT[index] / tot) if normalize_strength else float(self.strength_TT[index])
-            src_TT = TokamakSource(
-                major_radius=self.major_radius,
-                minor_radius=self.minor_radius,
-                elongation=self.elongation,
-                triangularity=self.triangularity,
-                shafranov_shift=self.shafranov_shift,
-                r_over_a=self.r_over_a,
-                emission_density=self.emission_density_TT[index],
-                energy=self.energy_TT,
-                method=self.method,
-                time=self.time,
-                phi_start=self.phi_start,
-                phi_extent=self.phi_extent,
-                n_alpha=self.n_alpha,
-                vertical_shift=self.vertical_shift,
-                strength=s_TT,
-                constraints=self.constraints
-            )
-            sources.append(src_TT)
+        channels = (
+            (self.strength_DT[index], self.emission_density_DT[index], self.energy_DT[index]),
+            (self.strength_DD[index], self.emission_density_DD[index], self.energy_DD[index]),
+            (self.strength_TT[index], self.emission_density_TT[index], self.energy_TT),
+        )
+        for s_raw, em_dens, energy_dist in channels:
+            if s_raw > 0.0 and np.any(em_dens > 0.0):
+                s_val = float(s_raw / tot) if normalize_strength else float(s_raw)
+                sources.append(TokamakSource(
+                    major_radius=self.major_radius,
+                    minor_radius=self.minor_radius,
+                    elongation=self.elongation,
+                    triangularity=self.triangularity,
+                    shafranov_shift=self.shafranov_shift,
+                    r_over_a=self.r_over_a,
+                    emission_density=em_dens,
+                    energy=energy_dist,
+                    method=self.method,
+                    time=self.time,
+                    phi_start=self.phi_start,
+                    phi_extent=self.phi_extent,
+                    n_alpha=self.n_alpha,
+                    vertical_shift=self.vertical_shift,
+                    strength=s_val,
+                    constraints=self.constraints
+                ))
 
         if not sources:
             raise ValueError(
@@ -2815,135 +3350,6 @@ class TokamakSourceEnsemble:
             )
 
         return sources
-
-    def sample_reaction(self, index: int, reaction: str = 'DT', normalize_strength: bool = False) -> TokamakSource:
-        """Constructs and returns a single TokamakSource realization for a specific reaction channel.
-
-        Parameters
-        ----------
-        index : int
-            Index of the realization.
-        reaction : {'DT', 'DD', 'TT', 'total'}
-            Reaction channel to sample.
-        normalize_strength : bool, optional
-            If True, sets strength = 1.0.
-
-        Returns
-        -------
-        openmc.TokamakSource
-            Initialized OpenMC TokamakSource for the specified reaction channel.
-        """
-        if index < 0 or index >= len(self):
-            raise IndexError(f"Sample index {index} out of range for ensemble of size {len(self)}.")
-
-        if reaction == 'DT':
-            if self.strength_DT[index] <= 0.0 or not np.any(self.emission_density_DT[index] > 0.0):
-                raise ValueError(
-                    f"Cannot sample 'DT' reaction: DT emission density is zero for realization {index} "
-                    "(missing Deuterium or Tritium fuel ions)."
-                )
-            s_val = 1.0 if normalize_strength else float(self.strength_DT[index])
-            return TokamakSource(
-                major_radius=self.major_radius,
-                minor_radius=self.minor_radius,
-                elongation=self.elongation,
-                triangularity=self.triangularity,
-                shafranov_shift=self.shafranov_shift,
-                r_over_a=self.r_over_a,
-                emission_density=self.emission_density_DT[index],
-                energy=self.energy_DT[index],
-                method=self.method,
-                time=self.time,
-                phi_start=self.phi_start,
-                phi_extent=self.phi_extent,
-                n_alpha=self.n_alpha,
-                vertical_shift=self.vertical_shift,
-                strength=s_val,
-                constraints=self.constraints
-            )
-        elif reaction == 'DD':
-            if self.strength_DD[index] <= 0.0 or not np.any(self.emission_density_DD[index] > 0.0):
-                raise ValueError(
-                    f"Cannot sample 'DD' reaction: DD emission density is zero for realization {index} "
-                    "(missing Deuterium fuel ions)."
-                )
-            s_val = 1.0 if normalize_strength else float(self.strength_DD[index])
-            return TokamakSource(
-                major_radius=self.major_radius,
-                minor_radius=self.minor_radius,
-                elongation=self.elongation,
-                triangularity=self.triangularity,
-                shafranov_shift=self.shafranov_shift,
-                r_over_a=self.r_over_a,
-                emission_density=self.emission_density_DD[index],
-                energy=self.energy_DD[index],
-                method=self.method,
-                time=self.time,
-                phi_start=self.phi_start,
-                phi_extent=self.phi_extent,
-                n_alpha=self.n_alpha,
-                vertical_shift=self.vertical_shift,
-                strength=s_val,
-                constraints=self.constraints
-            )
-        elif reaction == 'TT':
-            if self.strength_TT[index] <= 0.0 or not np.any(self.emission_density_TT[index] > 0.0):
-                raise ValueError(
-                    f"Cannot sample 'TT' reaction: TT emission density is zero for realization {index} "
-                    "(missing Tritium fuel ions)."
-                )
-            s_val = 1.0 if normalize_strength else float(self.strength_TT[index])
-            return TokamakSource(
-                major_radius=self.major_radius,
-                minor_radius=self.minor_radius,
-                elongation=self.elongation,
-                triangularity=self.triangularity,
-                shafranov_shift=self.shafranov_shift,
-                r_over_a=self.r_over_a,
-                emission_density=self.emission_density_TT[index],
-                energy=self.energy_TT,
-                method=self.method,
-                time=self.time,
-                phi_start=self.phi_start,
-                phi_extent=self.phi_extent,
-                n_alpha=self.n_alpha,
-                vertical_shift=self.vertical_shift,
-                strength=s_val,
-                constraints=self.constraints
-            )
-        elif reaction == 'total':
-            if self._strengths[index] <= 0.0 or not np.any(self.emission_density[index] > 0.0):
-                raise ValueError(
-                    f"Cannot sample 'total' reaction: total emission density is zero for realization {index}."
-                )
-            s_val = 1.0 if normalize_strength else float(self._strengths[index])
-            if self.strength_DT[index] > 0.0:
-                energy = self.energy_DT[index]
-            elif self.strength_DD[index] > 0.0:
-                energy = self.energy_DD[index]
-            else:
-                energy = self.energy_TT
-
-            return TokamakSource(
-                major_radius=self.major_radius,
-                minor_radius=self.minor_radius,
-                elongation=self.elongation,
-                triangularity=self.triangularity,
-                shafranov_shift=self.shafranov_shift,
-                r_over_a=self.r_over_a,
-                emission_density=self.emission_density[index],
-                energy=energy,
-                method=self.method,
-                time=self.time,
-                phi_start=self.phi_start,
-                phi_extent=self.phi_extent,
-                n_alpha=self.n_alpha,
-                vertical_shift=self.vertical_shift,
-                strength=s_val,
-                constraints=self.constraints
-            )
-        else:
-            raise ValueError(f"Invalid reaction '{reaction}'. Valid options: 'DT', 'DD', 'TT', 'total'.")
 
     @property
     def strengths(self) -> np.ndarray:
@@ -2961,27 +3367,25 @@ class TokamakSourceEnsemble:
         return float(np.std(self._strengths, ddof=1)) if len(self) > 1 else 0.0
 
     @property
+    def weights(self) -> np.ndarray:
+        """2D array of normalized reaction weights (DT, DD, TT) of shape (n_samples, 3)."""
+        tot = np.maximum(self._strengths, 1e-30)[:, np.newaxis]
+        return np.column_stack((self.strength_DT, self.strength_DD, self.strength_TT)) / tot
+
+    @property
     def weight_DT(self) -> np.ndarray:
         """Normalized emission weight fraction for D-T fusion per realization."""
-        tot = np.maximum(self._strengths, 1e-30)
-        return self.strength_DT / tot
+        return self.weights[:, 0]
 
     @property
     def weight_DD(self) -> np.ndarray:
         """Normalized emission weight fraction for D-D fusion per realization."""
-        tot = np.maximum(self._strengths, 1e-30)
-        return self.strength_DD / tot
+        return self.weights[:, 1]
 
     @property
     def weight_TT(self) -> np.ndarray:
         """Normalized emission weight fraction for T-T fusion per realization."""
-        tot = np.maximum(self._strengths, 1e-30)
-        return self.strength_TT / tot
-
-    @property
-    def weights(self) -> np.ndarray:
-        """2D array of normalized reaction weights (DT, DD, TT) of shape (n_samples, 3)."""
-        return np.column_stack((self.weight_DT, self.weight_DD, self.weight_TT))
+        return self.weights[:, 2]
 
     @staticmethod
     def _calculate_integrated_source_strength(
@@ -2992,13 +3396,13 @@ class TokamakSourceEnsemble:
         elongation: float | np.ndarray,
         triangularity: float | np.ndarray,
         shafranov_shift: float = 0.0
-    ) -> float:
+    ) -> float | np.ndarray:
         """Calculates total neutron emission rate (neutrons / second) across the tokamak plasma volume.
 
         Parameters
         ----------
         S_profile : numpy.ndarray
-            Volumetric fusion emissivity profile S(r) in [neutrons / m^3 / s].
+            Volumetric fusion emissivity profile S(r) in [neutrons / m^3 / s] (1D or 2D array).
         r_over_a : numpy.ndarray
             Normalized minor radius grid points in [0.0, 1.0].
         major_radius : float
@@ -3014,14 +3418,11 @@ class TokamakSourceEnsemble:
 
         Returns
         -------
-        float
+        float or numpy.ndarray
             Total neutron emission rate in [neutrons / s].
         """
-        from scipy.special import jv
-
         # Convert dimensions to meters for volume element.
-        # If major_radius > 20, geometry is defined in cm (OpenMC standard), convert to meters.
-        scale = 0.01 if major_radius > 20.0 else 1.0
+        scale = 0.01 / TokamakSource._resolve_length_scale_to_cm(major_radius)
         R0_m = major_radius * scale
         a_m = minor_radius * scale
         shift_m = shafranov_shift * scale
@@ -3033,32 +3434,79 @@ class TokamakSourceEnsemble:
         delta = np.asarray(triangularity, dtype=float)
         kappa = np.asarray(elongation, dtype=float)
 
-        c0 = jv(0, delta) + jv(2, delta)
-        c1 = np.where(c0 > 0, (jv(1, 2.0 * delta) + jv(3, 2.0 * delta)) / c0, 0.0)
+        if kappa.ndim > 0 and kappa.size > 1:
+            kp = CubicSpline(r_tilde, kappa, bc_type=((1, 0.0), 'not-a-knot')).derivative()(r_tilde)
+        else:
+            kp = np.zeros_like(r_tilde)
 
-        dV_dr = (4.0 * np.pi**2 * c0 * kappa * R0_m * a_m**2) * (
-            (1.0 + eps * delta_tilde) * r_tilde
-            - (3.0 / 8.0) * c1 * eps * r_tilde**2
-            - 2.0 * eps * delta_tilde * r_tilde**3
+        if delta.ndim > 0 and delta.size > 1:
+            dp = CubicSpline(r_tilde, delta, bc_type=((1, 0.0), 'not-a-knot')).derivative()(r_tilde)
+        else:
+            dp = np.zeros_like(r_tilde)
+
+        A = kappa * delta - kappa * r_tilde * dp + kp * r_tilde * delta
+        T1 = (
+            2.0 * np.pi * (kappa + 0.5 * kp * r_tilde) * jv(0, delta)
+            - np.pi * kp * r_tilde * jv(2, delta)
+            + 0.5 * np.pi * A * (jv(1, delta) + jv(3, delta))
+        )
+        T2 = (
+            -(kappa + 0.5 * kp * r_tilde) * jv(1, 2.0 * delta)
+            + 0.5 * kp * r_tilde * jv(3, 2.0 * delta)
+            + 0.25 * A * (jv(0, 2.0 * delta) - jv(4, 2.0 * delta))
+            - 2.0 * kappa * delta_tilde * r_tilde * (jv(0, delta) + jv(2, delta))
+        )
+        dV_dr = (
+            2.0 * np.pi * R0_m * (a_m**2) * r_tilde
+            * np.maximum(
+                0.0,
+                (1.0 + eps * delta_tilde - eps * delta_tilde * r_tilde**2) * T1
+                + eps * r_tilde * np.pi * T2
+            )
         )
 
+        S_arr = np.asarray(S_profile, dtype=float)
         trapz_fn = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
-        strength_n_per_sec = float(trapz_fn(np.asarray(S_profile, dtype=float) * dV_dr, r_tilde))
-        return max(0.0, strength_n_per_sec)
+        strength_n_per_sec = np.maximum(0.0, trapz_fn(S_arr * dV_dr, r_tilde, axis=-1))
+        return float(strength_n_per_sec) if S_arr.ndim == 1 else strength_n_per_sec
 
     @staticmethod
     def _perform_kl_expansion(
         cov_matrix: np.ndarray,
-        kl_components: int | float = 0.99
+        kl_components: int | float = 0.99,
+        grid: Sequence[float] | None = None,
+        weights: Sequence[float] | None = None
     ) -> dict[str, Any]:
-        """Performs Karhunen-Loeve spectral decomposition on a covariance matrix."""
-        from scipy.linalg import eigh
+        """Performs Karhunen-Loeve spectral decomposition on a covariance matrix.
+
+        When a non-uniform spatial ``grid`` or quadrature ``weights`` vector is
+        supplied, solves the symmetric Nyström integral eigenvalue problem
+        :math:`W^{1/2} C W^{1/2} u_k = \\lambda_k u_k` with :math:`\\phi_k = W^{-1/2} u_k`
+        so that dense grid regions do not bias the spectral mode basis.
+        """
         cov = np.asarray(cov_matrix, dtype=float)
         n_grid = cov.shape[0]
 
-        eigenvalues, eigenvectors = eigh(cov)
+        if weights is not None:
+            w = np.maximum(np.asarray(weights, dtype=float), 1e-30)
+        elif grid is not None and len(grid) == n_grid and n_grid > 1:
+            x = np.asarray(grid, dtype=float)
+            w = np.empty(n_grid, dtype=float)
+            w[0] = 0.5 * (x[1] - x[0])
+            w[1:-1] = 0.5 * (x[2:] - x[:-2])
+            w[-1] = 0.5 * (x[-1] - x[-2])
+            w = np.maximum(w, 1e-30)
+        else:
+            w = None
+
+        if w is not None:
+            sqrt_w = np.sqrt(w)
+            eigenvalues, eigenvectors = eigh(cov * np.outer(sqrt_w, sqrt_w))
+        else:
+            eigenvalues, eigenvectors = eigh(cov)
+
         idx = np.argsort(eigenvalues)[::-1]
-        eigenvalues = eigenvalues[idx]
+        eigenvalues = np.maximum(0.0, eigenvalues[idx])
         eigenvectors = eigenvectors[:, idx]
 
         total_var = np.sum(eigenvalues)
@@ -3067,14 +3515,16 @@ class TokamakSourceEnsemble:
         if isinstance(kl_components, (int, np.integer)):
             k_modes = min(int(kl_components), n_grid)
         elif isinstance(kl_components, (float, np.floating)):
-            k_modes = int(np.searchsorted(cum_var, float(kl_components)) + 1)
+            k_modes = int(np.searchsorted(cum_var, float(kl_components) - 1e-12) + 1)
             k_modes = min(k_modes, n_grid)
         else:
             raise ValueError("kl_components must be an int or float.")
 
         k_evals = eigenvalues[:k_modes]
         k_evecs = eigenvectors[:, :k_modes]
-        mode_basis = k_evecs * np.sqrt(np.maximum(0.0, k_evals))
+        if w is not None:
+            k_evecs = k_evecs / sqrt_w[:, np.newaxis]
+        mode_basis = k_evecs * np.sqrt(k_evals)
 
         return {
             'n_modes': k_modes,
@@ -3115,10 +3565,12 @@ class TokamakSourceEnsemble:
         phi_start: float = 0.0,
         phi_extent: float = 2.0 * np.pi,
         n_alpha: int = 101,
-        vertical_shift: float = 0.0,
+        vertical_shift: float | None = None,
         random_seed: int | np.random.Generator | None = None,
         scale_to_cm: float | None = None,
-        constraints: dict[str, Any] | None = None
+        constraints: dict[str, Any] | None = None,
+        time_index: int | None = None,
+        time_s: float | None = None
     ) -> TokamakSourceEnsemble:
         """Create a TokamakSourceEnsemble directly from an IMAS equilibrium and core profiles with covariance matrices.
 
@@ -3149,22 +3601,30 @@ class TokamakSourceEnsemble:
         n_alpha : int, optional
             Number of poloidal angle grid points (default: 101).
         vertical_shift : float, optional
-            Vertical shift of the plasma center in [cm] (default: 0.0).
+            Vertical shift of the plasma center in [cm]. If None (default), automatically
+            extracted from the IMAS equilibrium magnetic axis vertical position.
         random_seed : int or numpy.random.Generator, optional
             Random seed or generator for reproducible sampling.
+        scale_to_cm : float, optional
+            Scaling factor to convert spatial coordinates to cm (default: 100.0 if R0 < 20 m).
         constraints : dict, optional
             Constraints on sampled source particles.
+        time_index : int, optional
+            Time slice index to extract from time-dependent profiles.
+        time_s : float, optional
+            Target time in seconds to extract from time-dependent profiles (selects closest slice).
 
         Returns
         -------
         TokamakSourceEnsemble
             Initialized TokamakSourceEnsemble managing stochastic plasma realizations.
         """
-        from scipy.interpolate import CubicSpline
-
-        ods = TokamakSource._load_ods(imas_input)
+        ods = TokamakSource._load_ods(imas_input, time_index=time_index, time_s=time_s)
         data = TokamakSource._extract_and_map_imas_profiles(
-            ods, n_points=n_points, scale_to_cm=scale_to_cm, reaction='DT'
+            ods,
+            n_points=n_points,
+            scale_to_cm=scale_to_cm,
+            reaction='DT'
         )
 
         r_over_a = data['r_over_a']
@@ -3206,28 +3666,12 @@ class TokamakSourceEnsemble:
 
         cov_ne_raw = full_cov[np.ix_(ne_idx, ne_idx)]
         cov_Ti_raw = full_cov[np.ix_(ti_idx, ti_idx)]
+        cov_Ti_ne_raw = full_cov[np.ix_(ti_idx, ne_idx)]
 
-        # Scale electron density covariance for D and T species
+        # Scale electron density perturbations for D and T species (preserving quasi-neutrality)
         fD_raw = nD_mean_raw / np.maximum(ne_mean_raw, 1e-30)
         fT_raw = nT_mean_raw / np.maximum(ne_mean_raw, 1e-30)
-        cov_nD_raw = np.outer(fD_raw, fD_raw) * cov_ne_raw
-        cov_nT_raw = np.outer(fT_raw, fT_raw) * cov_ne_raw
 
-        # KL expansion on raw rho coordinate
-        kl_T = cls._perform_kl_expansion(cov_Ti_raw, kl_components=kl_components)
-        kl_nD = cls._perform_kl_expansion(cov_nD_raw, kl_components=kl_components)
-        kl_nT = cls._perform_kl_expansion(cov_nT_raw, kl_components=kl_components)
-
-        # Interpolate mode eigenvectors onto regular r_over_a grid (guarantees positive semi-definiteness)
-        V_T_rtilde = CubicSpline(r_tilde_mapped, kl_T['eigenvectors'], axis=0)(r_over_a)
-        V_nD_rtilde = CubicSpline(r_tilde_mapped, kl_nD['eigenvectors'], axis=0)(r_over_a)
-        V_nT_rtilde = CubicSpline(r_tilde_mapped, kl_nT['eigenvectors'], axis=0)(r_over_a)
-
-        mode_basis_T_rtilde = V_T_rtilde * np.sqrt(np.maximum(0.0, kl_T['eigenvalues']))
-        mode_basis_nD_rtilde = V_nD_rtilde * np.sqrt(np.maximum(0.0, kl_nD['eigenvalues']))
-        mode_basis_nT_rtilde = V_nT_rtilde * np.sqrt(np.maximum(0.0, kl_nT['eigenvalues']))
-
-        # RNG Sub-seeds
         if isinstance(random_seed, np.random.Generator):
             main_rng = random_seed
         elif random_seed is not None:
@@ -3235,18 +3679,76 @@ class TokamakSourceEnsemble:
         else:
             main_rng = np.random.default_rng()
 
-        seed_T = main_rng.integers(0, 2**31 - 1)
-        seed_nD = main_rng.integers(0, 2**31 - 1)
-        seed_nT = main_rng.integers(0, 2**31 - 1)
+        if len(r_tilde_mapped) > 1:
+            w_grid = np.empty(len(r_tilde_mapped), dtype=float)
+            w_grid[0] = 0.5 * (r_tilde_mapped[1] - r_tilde_mapped[0])
+            w_grid[1:-1] = 0.5 * (r_tilde_mapped[2:] - r_tilde_mapped[:-2])
+            w_grid[-1] = 0.5 * (r_tilde_mapped[-1] - r_tilde_mapped[-2])
+            w_grid = np.maximum(w_grid, 1e-30)
+        else:
+            w_grid = None
+
+        if np.any(np.abs(cov_Ti_ne_raw) > 0.0):
+            # Joint KL expansion on normalized (T_i, n_e) correlation matrix to preserve cross-covariances
+            n_ti = len(ti_idx)
+            joint_idx = ti_idx + ne_idx
+            cov_joint_raw = full_cov[np.ix_(joint_idx, joint_idx)]
+            std_joint = np.sqrt(np.maximum(0.0, np.diag(cov_joint_raw)))
+            inv_std = np.where(std_joint > 0.0, 1.0 / std_joint, 0.0)
+            corr_joint = cov_joint_raw * np.outer(inv_std, inv_std)
+
+            w_joint = (
+                np.concatenate([w_grid, w_grid])
+                if w_grid is not None and 2 * len(w_grid) == len(joint_idx)
+                else None
+            )
+            kl_joint = cls._perform_kl_expansion(
+                corr_joint, kl_components=kl_components, weights=w_joint
+            )
+            basis_joint_raw = kl_joint['mode_basis'] * std_joint[:, np.newaxis]
+            basis_T_raw = basis_joint_raw[:n_ti, :]
+            basis_ne_raw = basis_joint_raw[n_ti:, :]
+            kl_T_info = {'n_modes': kl_joint['n_modes'], 'explained_variance': kl_joint['explained_variance_ratio']}
+            kl_ne_info = {'n_modes': kl_joint['n_modes'], 'explained_variance': kl_joint['explained_variance_ratio']}
+            seed_T = int(main_rng.integers(0, 2**31 - 1))
+            seed_ne = seed_T
+        else:
+            # Separate KL expansions for T_i and n_e
+            kl_T = cls._perform_kl_expansion(
+                cov_Ti_raw, kl_components=kl_components, grid=r_tilde_mapped
+            )
+            kl_ne = cls._perform_kl_expansion(
+                cov_ne_raw, kl_components=kl_components, grid=r_tilde_mapped
+            )
+            basis_T_raw = kl_T['mode_basis']
+            basis_ne_raw = kl_ne['mode_basis']
+            kl_T_info = {'n_modes': kl_T['n_modes'], 'explained_variance': kl_T['explained_variance_ratio']}
+            kl_ne_info = {'n_modes': kl_ne['n_modes'], 'explained_variance': kl_ne['explained_variance_ratio']}
+            seed_T = int(main_rng.integers(0, 2**31 - 1))
+            seed_ne = int(main_rng.integers(0, 2**31 - 1))
+
+        basis_nD_raw = basis_ne_raw * fD_raw[:, np.newaxis]
+        basis_nT_raw = basis_ne_raw * fT_raw[:, np.newaxis]
+
+        # Interpolate mode basis onto regular r_over_a grid with neutral edge clamping
+        r_eval = np.clip(r_over_a, r_tilde_mapped[0], r_tilde_mapped[-1])
+        mode_basis_T_rtilde = PchipInterpolator(r_tilde_mapped, basis_T_raw, axis=0)(r_eval)
+        mode_basis_nD_rtilde = PchipInterpolator(r_tilde_mapped, basis_nD_raw, axis=0)(r_eval)
+        mode_basis_nT_rtilde = PchipInterpolator(r_tilde_mapped, basis_nT_raw, axis=0)(r_eval)
 
         T_ens = cls._sample_kl_expansion(
             temperature_mean, mode_basis_T_rtilde, n_samples=n_samples, rng=np.random.default_rng(seed_T)
         )
+        # Share seed_ne between D and T so delta_nD / nD == delta_nT / nT == delta_ne / ne
         nD_ens = cls._sample_kl_expansion(
-            density_D_mean, mode_basis_nD_rtilde, n_samples=n_samples, rng=np.random.default_rng(seed_nD)
+            density_D_mean, mode_basis_nD_rtilde, n_samples=n_samples, rng=np.random.default_rng(seed_ne)
         )
         nT_ens = cls._sample_kl_expansion(
-            density_T_mean, mode_basis_nT_rtilde, n_samples=n_samples, rng=np.random.default_rng(seed_nT)
+            density_T_mean, mode_basis_nT_rtilde, n_samples=n_samples, rng=np.random.default_rng(seed_ne)
+        )
+
+        resolved_vertical_shift = (
+            data.get('vertical_shift', 0.0) if vertical_shift is None else float(vertical_shift)
         )
 
         ens = cls(
@@ -3264,22 +3766,13 @@ class TokamakSourceEnsemble:
             phi_start=phi_start,
             phi_extent=phi_extent,
             n_alpha=n_alpha,
-            vertical_shift=vertical_shift,
+            vertical_shift=resolved_vertical_shift,
             constraints=constraints
         )
         ens.kl_info = {
-            'T_i': {
-                'n_modes': kl_T['n_modes'],
-                'explained_variance': kl_T['explained_variance_ratio']
-            },
-            'n_D': {
-                'n_modes': kl_nD['n_modes'],
-                'explained_variance': kl_nD['explained_variance_ratio']
-            },
-            'n_T': {
-                'n_modes': kl_nT['n_modes'],
-                'explained_variance': kl_nT['explained_variance_ratio']
-            }
+            'T_i': dict(kl_T_info),
+            'n_D': dict(kl_ne_info),
+            'n_T': dict(kl_ne_info)
         }
         return ens
 

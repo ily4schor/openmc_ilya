@@ -3871,44 +3871,33 @@ class UQResult:
         """Converts UQ realization data and statistics to a pandas DataFrame."""
         import pandas as pd
 
+        if self.n_realizations == 0:
+            return pd.DataFrame()
+
         target_tallies = [tally_name] if tally_name else sorted(self.realization_means.keys())
         all_dfs = []
+        n_real = self.n_realizations
 
         for name in target_tallies:
             stats = self.get_tally(name, mode=mode)
-            means = stats['mean']
-            means_arr = np.atleast_1d(means)
-            
-            # Retrieve the structural DataFrame saved from the first realization
-            meta = self.tally_metadata.get(name, {})
-            df_struct = meta.get('df_structure', None)
+            samples_2d = np.asarray(stats['samples'], dtype=float).reshape(n_real, -1)
+            n_bins = samples_2d.shape[1]
+            df_struct = self.tally_metadata.get(name, {}).get('df_structure', None)
 
-            for i in range(self.n_realizations):
-                sample_val = stats['samples'][i]
-                sample_arr = np.atleast_1d(sample_val)
-                
-                if df_struct is not None:
-                    # Create a copy of the structure for this realization
-                    df = df_struct.copy()
-                    df['tally'] = name
-                    df['realization'] = i
-                    df['source_strength_n_per_s'] = self.strengths[i]
-                    df['value'] = sample_arr.flatten()
-                    all_dfs.append(df)
-                else:
-                    # Fallback if structure is missing
-                    records = []
-                    for bin_idx, val in enumerate(sample_arr.flat):
-                        records.append({
-                            'tally': name,
-                            'bin': bin_idx,
-                            'realization': i,
-                            'source_strength_n_per_s': self.strengths[i],
-                            'value': float(val),
-                        })
-                    all_dfs.append(pd.DataFrame(records))
+            if df_struct is not None and len(df_struct) == n_bins:
+                df = pd.concat([df_struct] * n_real, ignore_index=True)
+                df['tally'] = name
+                df['realization'] = np.repeat(np.arange(n_real), n_bins)
+                df['source_strength_n_per_s'] = np.repeat(self.strengths, n_bins)
+                df['value'] = samples_2d.ravel()
+            else:
+                df = pd.DataFrame({
+                    'tally': name,
+                    'bin': np.tile(np.arange(n_bins), n_real),
+                    'realization': np.repeat(np.arange(n_real), n_bins),
+                    'source_strength_n_per_s': np.repeat(self.strengths, n_bins),
+                    'value': samples_2d.ravel(),
+                })
+            all_dfs.append(df)
 
-        if all_dfs:
-            return pd.concat(all_dfs, ignore_index=True)
-        else:
-            return pd.DataFrame()
+        return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()

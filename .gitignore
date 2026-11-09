@@ -113,3 +113,6 @@ CMakeSettings.json
 
 # Third-party vendor dependencies fetched by CMake FetchContent
 vendor/
+
+# Local type-checker / IDE config
+pyrefly.toml
