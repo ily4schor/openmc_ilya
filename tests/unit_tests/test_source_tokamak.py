@@ -1033,6 +1033,29 @@ def test_from_imas_multislice_hdf5(tmp_path):
     with pytest.raises(ValueError, match="No covariance data found in IMAS core_profiles"):
         openmc.TokamakSourceEnsemble.from_imas(tmp_path, time_s=1.0)
 
+    # 6. Loading via time_norm: 0.0 -> t=0.5s (slice 0), 1.0 -> t=1.0s (slice 1)
+    source_tn0 = openmc.TokamakSource.from_imas(tmp_path, time_norm=0.0, reaction='DT')
+    assert np.isclose(source_tn0.major_radius, source_s0.major_radius)
+    assert np.isclose(source_tn0.elongation[-1], 1.4)
+
+    source_tn1 = openmc.TokamakSource.from_imas(tmp_path, time_norm=1.0, reaction='DT')
+    assert np.isclose(source_tn1.major_radius, source_s1.major_radius)
+    assert np.isclose(source_tn1.elongation[-1], 1.6)
+
+    # 7. Intermediate time_norm values
+    source_tn_mid1 = openmc.TokamakSource.from_imas(tmp_path, time_norm=0.8, reaction='DT')
+    assert np.isclose(source_tn_mid1.elongation[-1], 1.6)
+
+    source_tn_mid0 = openmc.TokamakSource.from_imas(tmp_path, time_norm=0.2, reaction='DT')
+    assert np.isclose(source_tn_mid0.elongation[-1], 1.4)
+
+    # 8. Out-of-bounds time_norm should raise ValueError
+    with pytest.raises(ValueError, match="'time_norm' must be a float between 0.0 and 1.0"):
+        openmc.TokamakSource.from_imas(tmp_path, time_norm=-0.1)
+
+    with pytest.raises(ValueError, match="'time_norm' must be a float between 0.0 and 1.0"):
+        openmc.TokamakSource.from_imas(tmp_path, time_norm=1.05)
+
 
 def test_from_imas_vertical_shift_autodetect_and_override():
     """Verify automatic vertical_shift extraction and user override."""
@@ -1154,7 +1177,7 @@ def test_from_imas_independent_time_bases(tmp_path):
 
 
 def test_from_imas_time_warnings():
-    """Verify warnings when time parameters are passed to in-memory ODS or when both time_index and time_s are given."""
+    """Verify warnings when time parameters are passed to in-memory ODS or when multiple time parameters are given."""
     from omas import ODS
 
     ods = ODS(consistency_check=False)
@@ -1171,9 +1194,60 @@ def test_from_imas_time_warnings():
     assert any("ignored when imas_input is an in-memory ODS or dict" in m for m in messages)
 
     with pytest.warns(UserWarning) as record:
+        openmc.TokamakSource.from_imas(ods, time_norm=0.5)
+    messages = [str(w.message) for w in record]
+    assert any("ignored when imas_input is an in-memory ODS or dict" in m for m in messages)
+
+    with pytest.warns(UserWarning) as record:
         openmc.TokamakSource._load_ods(ods, time_index=0, time_s=1.0)
     messages = [str(w.message) for w in record]
     assert any("Both 'time_index' and 'time_s' were provided" in m for m in messages)
+
+    with pytest.warns(UserWarning) as record:
+        openmc.TokamakSource._load_ods(ods, time_index=0, time_norm=0.5)
+    messages = [str(w.message) for w in record]
+    assert any("Both 'time_index' and 'time_norm' were provided" in m for m in messages)
+
+    with pytest.warns(UserWarning) as record:
+        openmc.TokamakSource._load_ods(ods, time_s=1.0, time_norm=0.5)
+    messages = [str(w.message) for w in record]
+    assert any("Both 'time_s' and 'time_norm' were provided" in m for m in messages)
+
+
+def test_from_imas_time_norm_non_uniform_slices(tmp_path):
+    """Verify that time_norm selects slices proportionally to physical time, not slice index."""
+    h5py = pytest.importorskip("h5py")
+
+    # Time grid: 5 slices closely spaced in [0.0, 0.4], 1 slice at 10.0 s
+    # Total duration: 0.0 to 10.0 s
+    times = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 10.0])
+    kappas = np.array([1.1, 1.2, 1.3, 1.4, 1.5, 2.0])
+
+    eq_file = tmp_path / 'equilibrium.h5'
+    cp_file = tmp_path / 'core_profiles.h5'
+
+    with h5py.File(eq_file, 'w') as f:
+        f.create_dataset('equilibrium/time', data=times)
+        f.create_dataset('equilibrium/time_slice[]&boundary&minor_radius', data=np.full(len(times), 1.0))
+        f.create_dataset('equilibrium/time_slice[]&boundary&geometric_axis&r', data=np.full(len(times), 3.0))
+        f.create_dataset('equilibrium/time_slice[]&boundary&elongation', data=kappas)
+        f.create_dataset('equilibrium/time_slice[]&boundary&triangularity', data=np.full(len(times), 0.3))
+        f.create_dataset('equilibrium/time_slice[]&profiles_1d&rho_tor_norm', data=np.tile(np.linspace(0, 1, 11), (len(times), 1)))
+
+    with h5py.File(cp_file, 'w') as f:
+        f.create_dataset('core_profiles/time', data=times)
+        f.create_dataset('core_profiles/profiles_1d[]&grid&rho_tor_norm', data=np.tile(np.linspace(0, 1, 11), (len(times), 1)))
+        f.create_dataset('core_profiles/profiles_1d[]&electrons&density', data=np.full((len(times), 11), 1e20))
+        f.create_dataset('core_profiles/profiles_1d[]&electrons&temperature', data=np.full((len(times), 11), 5000.0))
+
+    # time_norm = 0.6 -> t_target = 0.0 + 0.6 * (10.0 - 0.0) = 6.0 s.
+    # Closest slice to 6.0 s is slice index 5 (t = 10.0 s, dist = 4.0), NOT slice index 3 or 4.
+    src_prop = openmc.TokamakSource.from_imas(tmp_path, time_norm=0.6, reaction='DT')
+    assert np.isclose(src_prop.elongation[-1], 2.0)
+
+    # time_norm = 0.02 -> t_target = 0.2 s -> matches slice index 2 (t = 0.2 s, kappa = 1.3)
+    src_early = openmc.TokamakSource.from_imas(tmp_path, time_norm=0.02, reaction='DT')
+    assert np.isclose(src_early.elongation[-1], 1.3)
 
 
 def test_dd_neutron_branching_and_tt_multiplicity():

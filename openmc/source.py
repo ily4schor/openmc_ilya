@@ -1663,7 +1663,8 @@ class TokamakSource(SourceBase):
         scale_to_cm: float | None = None,
         constraints: dict[str, Any] | None = None,
         time_index: int | None = None,
-        time_s: float | None = None
+        time_s: float | None = None,
+        time_norm: float | None = None
     ) -> TokamakSource:
         """Create a deterministic TokamakSource directly from an IMAS equilibrium and core profiles.
 
@@ -1700,6 +1701,9 @@ class TokamakSource(SourceBase):
             Time slice index to extract from time-dependent profiles.
         time_s : float, optional
             Target time in seconds to extract from time-dependent profiles (selects closest slice).
+        time_norm : float, optional
+            Normalized time in [0.0, 1.0] to extract from time-dependent profiles (proportional
+            to physical time duration: t_target = t_min + time_norm * (t_max - t_min)).
 
         Returns
         -------
@@ -1707,7 +1711,7 @@ class TokamakSource(SourceBase):
             Initialized TokamakSource with calculated emission density and
             energy distributions.
         """
-        ods = cls._load_ods(imas_input, time_index=time_index, time_s=time_s)
+        ods = cls._load_ods(imas_input, time_index=time_index, time_s=time_s, time_norm=time_norm)
         data = cls._extract_and_map_imas_profiles(
             ods,
             n_points=n_points,
@@ -1925,7 +1929,8 @@ class TokamakSource(SourceBase):
         path: Path,
         ods: Any,
         time_index: int | None = None,
-        time_s: float | None = None
+        time_s: float | None = None,
+        time_norm: float | None = None
     ) -> bool:
         """Read IMAS NetCDF-4 dataset using the official imas-python library.
 
@@ -1939,6 +1944,8 @@ class TokamakSource(SourceBase):
             Time slice index to extract from time-dependent profiles (default: 0).
         time_s : float, optional
             Target time in seconds to extract from time-dependent profiles.
+        time_norm : float, optional
+            Normalized time in [0.0, 1.0] to extract from time-dependent profiles.
 
         Returns
         -------
@@ -1970,11 +1977,17 @@ class TokamakSource(SourceBase):
                             continue
 
                         file_time_index = time_index if time_index is not None else 0
-                        if time_s is not None and time_index is None and hasattr(ids_obj, 'time'):
+                        if (time_s is not None or time_norm is not None) and time_index is None and hasattr(ids_obj, 'time'):
                             if cls._has_imas_data(ids_obj.time):
                                 times = np.asarray(ids_obj.time)
                                 if times.size > 0:
-                                    file_time_index = int(np.argmin(np.abs(times - time_s)))
+                                    if time_s is not None:
+                                        target_t = time_s
+                                    else:
+                                        t_min = float(np.min(times))
+                                        t_max = float(np.max(times))
+                                        target_t = t_min + time_norm * (t_max - t_min)
+                                    file_time_index = int(np.argmin(np.abs(times - target_t)))
 
                         if ids_name == 'core_profiles':
                             if hasattr(ids_obj, 'profiles_1d'):
@@ -2066,7 +2079,8 @@ class TokamakSource(SourceBase):
         path: Path,
         ods: Any,
         time_index: int | None = None,
-        time_s: float | None = None
+        time_s: float | None = None,
+        time_norm: float | None = None
     ) -> bool:
         """Parse native IMAS Access Layer multi-HDF5 dataset files into an OMAS Data Structure (ODS).
 
@@ -2080,6 +2094,8 @@ class TokamakSource(SourceBase):
             Time slice index to extract from time-dependent profiles.
         time_s : float, optional
             Target time in seconds to extract from time-dependent profiles (selects closest slice).
+        time_norm : float, optional
+            Normalized time in [0.0, 1.0] to extract from time-dependent profiles.
 
         Returns
         -------
@@ -2102,10 +2118,10 @@ class TokamakSource(SourceBase):
         if not found_target:
             return False
 
-        # Resolve time index independently per target IDS if time_s is provided
+        # Resolve time index independently per target IDS if time_s or time_norm is provided
         ids_time_indices: dict[str, int] = {}
         ids_actual_times: dict[str, float] = {}
-        if time_s is not None and time_index is None:
+        if (time_s is not None or time_norm is not None) and time_index is None:
             for f in files:
                 try:
                     with h5py.File(str(f), 'r') as h5f:
@@ -2118,7 +2134,13 @@ class TokamakSource(SourceBase):
                                 if time_k in h5f and isinstance(h5f[time_k], h5py.Dataset):
                                     times = np.asarray(h5f[time_k][:])
                                     if times.size > 0:
-                                        t_idx = int(np.argmin(np.abs(times - time_s)))
+                                        if time_s is not None:
+                                            target_t = time_s
+                                        else:
+                                            t_min = float(np.min(times))
+                                            t_max = float(np.max(times))
+                                            target_t = t_min + time_norm * (t_max - t_min)
+                                        t_idx = int(np.argmin(np.abs(times - target_t)))
                                         ids_time_indices[target_id] = t_idx
                                         ids_actual_times[target_id] = float(times[t_idx])
                                         break
@@ -2204,7 +2226,8 @@ class TokamakSource(SourceBase):
         path: Path,
         ods: Any,
         time_index: int | None = None,
-        time_s: float | None = None
+        time_s: float | None = None,
+        time_norm: float | None = None
     ) -> bool:
         """Parse native IMAS NetCDF-4 dataset files into an OMAS Data Structure (ODS).
 
@@ -2226,6 +2249,8 @@ class TokamakSource(SourceBase):
             Time slice index to extract from time-dependent profiles (default: 0).
         time_s : float, optional
             Target time in seconds to extract from time-dependent profiles (selects closest slice).
+        time_norm : float, optional
+            Normalized time in [0.0, 1.0] to extract from time-dependent profiles.
 
         Returns
         -------
@@ -2247,9 +2272,9 @@ class TokamakSource(SourceBase):
         target_ids = ('core_profiles', 'equilibrium', 'summary')
         loaded_ids = set()
 
-        # Resolve time_index independently per target IDS from time_s if requested
+        # Resolve time_index independently per target IDS from time_s or time_norm if requested
         ids_time_indices: dict[str, int] = {}
-        if time_s is not None and time_index is None:
+        if (time_s is not None or time_norm is not None) and time_index is None:
             for f in files:
                 try:
                     with netCDF4.Dataset(str(f), 'r') as ds:
@@ -2261,7 +2286,13 @@ class TokamakSource(SourceBase):
                                         if v_name in ('time', 'profiles_1d.time', 'equilibrium.time', f'{ids_name}.time'):
                                             times = np.asarray(var[:])
                                             if times.size > 0:
-                                                ids_time_indices[ids_name] = int(np.argmin(np.abs(times - time_s)))
+                                                if time_s is not None:
+                                                    target_t = time_s
+                                                else:
+                                                    t_min = float(np.min(times))
+                                                    t_max = float(np.max(times))
+                                                    target_t = t_min + time_norm * (t_max - t_min)
+                                                ids_time_indices[ids_name] = int(np.argmin(np.abs(times - target_t)))
                                                 break
                 except Exception:
                     pass
@@ -2361,7 +2392,8 @@ class TokamakSource(SourceBase):
         cls,
         imas_input: PathLike | str | Any,
         time_index: int | None = None,
-        time_s: float | None = None
+        time_s: float | None = None,
+        time_norm: float | None = None
     ) -> Any:
         """Loads an IMAS dataset from path or returns existing in-memory ODS instance.
 
@@ -2379,6 +2411,9 @@ class TokamakSource(SourceBase):
             Time slice index to extract from time-dependent profiles (default: 0).
         time_s : float, optional
             Target time in seconds to extract from time-dependent profiles (selects closest slice).
+        time_norm : float, optional
+            Normalized time in [0.0, 1.0] to extract from time-dependent profiles (selects closest
+            slice to t_min + time_norm * (t_max - t_min)).
 
         Returns
         -------
@@ -2392,7 +2427,7 @@ class TokamakSource(SourceBase):
         FileNotFoundError
             If the specified file or directory does not exist or contains no valid datasets.
         ValueError
-            If the format or file extension is unsupported.
+            If the format or file extension is unsupported or time_norm is not in [0.0, 1.0].
         """
         try:
             from omas import ODS, load_omas_h5, load_omas_nc
@@ -2408,12 +2443,29 @@ class TokamakSource(SourceBase):
                 UserWarning,
                 stacklevel=2,
             )
+        if time_norm is not None:
+            if not isinstance(time_norm, (int, float, np.number)) or time_norm < 0.0 or time_norm > 1.0:
+                raise ValueError(
+                    f"'time_norm' must be a float between 0.0 and 1.0, got {time_norm}."
+                )
+            if time_index is not None:
+                warnings.warn(
+                    "Both 'time_index' and 'time_norm' were provided; 'time_index' takes precedence.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            elif time_s is not None:
+                warnings.warn(
+                    "Both 'time_s' and 'time_norm' were provided; 'time_s' takes precedence.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         # 0. Pass-through in-memory representations
         if isinstance(imas_input, (ODS, dict)):
-            if time_index is not None or time_s is not None:
+            if time_index is not None or time_s is not None or time_norm is not None:
                 warnings.warn(
-                    "'time_index' and 'time_s' parameters are ignored when imas_input is an in-memory ODS or dict.",
+                    "'time_index', 'time_s', and 'time_norm' parameters are ignored when imas_input is an in-memory ODS or dict.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -2425,17 +2477,17 @@ class TokamakSource(SourceBase):
 
         # 1. Primary: Official imas-python reader
         ods_py = ODS(consistency_check=False)
-        if cls._read_imas_python(path, ods_py, time_index=time_index, time_s=time_s):
+        if cls._read_imas_python(path, ods_py, time_index=time_index, time_s=time_s, time_norm=time_norm):
             return ods_py
 
         # 2. Native IMAS Access Layer multi-HDF5 reader
         ods_h5 = ODS(consistency_check=False)
-        if cls._read_imas_hdf5(path, ods_h5, time_index=time_index, time_s=time_s):
+        if cls._read_imas_hdf5(path, ods_h5, time_index=time_index, time_s=time_s, time_norm=time_norm):
             return ods_h5
 
         # 3. Portable Fallback: Standalone NetCDF-4 group reader (no imas-python required)
         ods_nc = ODS(consistency_check=False)
-        if cls._read_imas_netcdf(path, ods_nc, time_index=time_index, time_s=time_s):
+        if cls._read_imas_netcdf(path, ods_nc, time_index=time_index, time_s=time_s, time_norm=time_norm):
             return ods_nc
 
         # 4. Legacy Fallback: Single flat OMAS files (.nc, .h5, .hdf5)
@@ -3570,7 +3622,8 @@ class TokamakSourceEnsemble:
         scale_to_cm: float | None = None,
         constraints: dict[str, Any] | None = None,
         time_index: int | None = None,
-        time_s: float | None = None
+        time_s: float | None = None,
+        time_norm: float | None = None
     ) -> TokamakSourceEnsemble:
         """Create a TokamakSourceEnsemble directly from an IMAS equilibrium and core profiles with covariance matrices.
 
@@ -3613,13 +3666,16 @@ class TokamakSourceEnsemble:
             Time slice index to extract from time-dependent profiles.
         time_s : float, optional
             Target time in seconds to extract from time-dependent profiles (selects closest slice).
+        time_norm : float, optional
+            Normalized time in [0.0, 1.0] to extract from time-dependent profiles (proportional
+            to physical time duration: t_target = t_min + time_norm * (t_max - t_min)).
 
         Returns
         -------
         TokamakSourceEnsemble
             Initialized TokamakSourceEnsemble managing stochastic plasma realizations.
         """
-        ods = TokamakSource._load_ods(imas_input, time_index=time_index, time_s=time_s)
+        ods = TokamakSource._load_ods(imas_input, time_index=time_index, time_s=time_s, time_norm=time_norm)
         data = TokamakSource._extract_and_map_imas_profiles(
             ods,
             n_points=n_points,
